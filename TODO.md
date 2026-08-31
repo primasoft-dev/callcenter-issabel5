@@ -2,29 +2,9 @@
 
 Unresolved issues for the call center module. Items are sorted by urgency (Critical → High → Medium → Low). Within each urgency level, untouched items appear first, followed by partially solved items.
 
-**Last Reviewed**: 2026-03-09
+**Last Reviewed**: 2026-08-29
 
----
-
-## Critical
-
-### ECCP Authentication Security
-
-* **Type**: Bug
-* **Urgency**: Critical
-* **Date Added**: Original (pre-2011)
-* **Location**: `ECCPConn.class.php:337-344`
-* **Description**: Password sent over unencrypted connection (plaintext or hash). The FIXME comment notes that sending a hash vs plaintext on an unencrypted connection is equally insecure since both can be captured with a sniffer.
-* **Status**: Untouched
-
-### Asterisk Restart Detection
-
-* **Type**: Feature
-* **Urgency**: Critical
-* **Date Added**: Original (pre-2011)
-* **Location**: `CampaignProcess.class.php:271-281`
-* **Description**: Detect Asterisk restart and re-synchronize dialer state. When Asterisk is restarted, it forgets all in-progress calls and logged-in agents. A detection and resynchronization mechanism is needed.
-* **Status**: Untouched
+`Change #N` references point to the numbered entries in `CHANGES_PRE.md`.
 
 ---
 
@@ -35,50 +15,13 @@ Unresolved issues for the call center module. Items are sorted by urgency (Criti
 * **Type**: Feature
 * **Urgency**: High
 * **Date Added**: Original (pre-2011)
-* **Location**: `ECCPConn.class.php:345-348`
+* **Location**: `ECCPConn.class.php:344-347`
 * **Description**: Implement `eccp_authorized_clients` table for agent authorization. The table exists and is used for authorization lookup, but could be expanded for IP/client-based authorization.
-* **Status**: Partially Solved
-
-### XSS in Debug Function
-
-* **Type**: Bug
-* **Urgency**: High
-* **Date Added**: 2026-03-07 (Change #39)
-* **Location**: `issabel2.lib.php:411-413`
-* **Description**: Fix XSS vulnerability - use `htmlspecialchars` instead of manual escaping in `_cc_debug_flush_html()`. Only exploitable when debug mode is enabled.
-* **Status**: Untouched
-
-### Attended Transfer for Agent Type Login
-
-* **Type**: Feature
-* **Urgency**: High
-* **Date Added**: 2026-03-09 
-* **Location**: `Agent Console`
-* **Description**: Fix attended transfer functionality for agent type login - review all newly added dialplan contexts for attended transfer.
 * **Status**: Partially Solved
 
 ---
 
 ## Medium
-
-### Hold Timeout Countdown
-
-* **Type**: Feature
-* **Urgency**: Low
-* **Date Added**: Original (pre-2011)
-* **Date Updated**: 2026-03-09
-* **Location**: `AMIEventProcess.class.php:4014-4015`, `agent_console/`
-* **Description**: When agent puts call on hold, call is parked in Asterisk with configurable timeout (default 45-180 seconds, set in `features.conf` parkingtime). The `ParkedCall` AMI event includes `Timeout` parameter (seconds until auto-return) but this is NOT displayed to agents. Feature request: (1) Add "Call On-Hold" status to agent console with distinct color in status bar (e.g., yellow/orange indicator), (2) Add hold duration counter showing elapsed time, (3) Add countdown timer showing time REMAINING until call returns. Current implementation tracks `onhold` flag and has `shiftHoldTime` for elapsed time, but no countdown. Implementation requires: store parking timeout in `Llamada` object, include `parking_timeout` in ECCP agent status XML, add JavaScript countdown timer, add UI element to agent console template.
-* **Status**: Untouched
-
-### Campaign Purge Pending Calls
-
-* **Type**: Feature
-* **Urgency**: Medium
-* **Date Added**: 2026-03-09
-* **Location**: `modules/campaign_out/`
-* **Description**: Add purge option in outgoing campaigns module to delete all pending calls (calls with status Pending, Placing, etc.). Currently no way to clear pending calls without database operations.
-* **Status**: Untouched
 
 ### RINGING-as-Free Analysis
 
@@ -88,6 +31,25 @@ Unresolved issues for the call center module. Items are sorted by urgency (Criti
 * **Location**: `QueueShadow.class.php`, `Predictor.class.php`
 * **Description**: Even in predictive mode, counting RINGING agents as "free" may cause over-placement. Analysis needed to determine if this behavior is optimal.
 * **Status**: Untouched
+
+### Attended-Transfer Hold Has No Orphan Check
+
+* **Type**: Bug
+* **Urgency**: Medium
+* **Date Added**: 2026-08-30 (Change #70)
+* **Location**: `extensions_custom.conf:33`, `setup/installer.php:357`
+* **Description**: `[atxfer-hold]` is a bare `MusicOnHold(,1800)` with no check that the agent who put the caller there still exists, so any path that ever leaves a caller in it means up to 30 minutes of music with nobody on the other end. Change #70 removed the one known such path (the `Bridge()` thread race) and added a `SoftHangup` backstop inside `[atxfer-rebridge]`, but the context itself is still a dead end: the residual exposure is a caller orphaned during the ~2 s reconnect window, or by any future path. The `1800` is also now out of step with the 900 s hold cap the `callcenter_hold` parking lot got in Change #69. Proposed fix: have the dialer `SetVar` the agent's channel name onto the client channel at both `Redirect` sites in `ECCPConn::Request_agentauth_atxfercall()`, then run the hold as chunked `MusicOnHold` slices that bail out via `CHANNEL_EXISTS()` once that channel is gone. `res_musiconhold` restores the saved position for `mode=files` classes, so chunking does not restart the music. Deferred from Change #70 to keep that fix to a single file.
+* **Status**: Untouched
+
+### Hold Timeout Countdown
+
+* **Type**: Feature
+* **Urgency**: Low
+* **Date Added**: Original (pre-2011)
+* **Date Updated**: 2026-08-30
+* **Location**: `AMIEventProcess.class.php:4014-4015`, `agent_console/`
+* **Description**: When agent puts call on hold, call is parked in Asterisk with a configurable timeout (900 seconds, the `parkingtime` of the `callcenter_hold` lot in `/etc/asterisk/res_parking_custom_general.conf`; Change #69). The `ParkedCall` AMI event includes `Timeout` parameter (seconds until auto-return) but this is NOT displayed to agents, so an agent has no warning that a held call is about to come back. Add a countdown timer showing the time REMAINING until the call returns. Implementation requires: store the parking timeout in the `Llamada` object, include `parking_timeout` in the ECCP agent status XML, add a JavaScript countdown, and add the UI element. The original request also asked for an on-hold status with a distinct colour in the status bar and an elapsed-hold counter; both were delivered by Change #61, which leaves only the countdown. Note that since Change #69 the timeout no longer returns the caller to the agent — `park-return-routing` has no entry for the 70xxx slots, so Asterisk hangs the parked channel up and the dialer finalizes the call — so the countdown is a warning that the call is about to *end*.
+* **Status**: Partially Solved
 
 ---
 

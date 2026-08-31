@@ -36,6 +36,18 @@ class MultiplexServer
     // List of listener objects, of various types
     protected $_listaConn = array();
 
+    /* Contexto SSL del socket de escucha, o NULL si las conexiones son en
+     * texto claro. Si no es NULL, cada conexión aceptada debe completar una
+     * negociación TLS antes de que se lea dato alguno de ella. */
+    /* SSL context of the listening socket, or NULL if connections are in
+     * plain text. If not NULL, every accepted connection must complete a TLS
+     * negotiation before any data is read from it. */
+    private $_rContextoSSL = NULL;
+
+    // Segundos que se concede a una conexión para completar la negociación TLS
+    // Seconds granted to a connection to complete the TLS negotiation
+    const TIMEOUT_HANDSHAKE_TLS = 15;
+
     /**
      * Constructor del objeto. Se esperan los siguientes parámetros:
      * Object constructor. The following parameters are expected:
@@ -51,15 +63,27 @@ class MultiplexServer
      * stream_select() sobre el socket.
      * stream_select() on the socket.
      */
-    function __construct($sUrlSocket, &$oLog)
+    function __construct($sUrlSocket, &$oLog, $rContextoSSL = NULL)
     {
         $this->_oLog =& $oLog;
         $this->_conexiones = array();
         $this->_uniqueid = 0;
+        $this->_rContextoSSL = $rContextoSSL;
         $errno = $errstr = NULL;
         $this->_hEscucha = FALSE;
         if (!is_null($sUrlSocket)) {
-            $this->_hEscucha = stream_socket_server($sUrlSocket, $errno, $errstr);
+            if (is_null($rContextoSSL)) {
+                $this->_hEscucha = stream_socket_server($sUrlSocket, $errno, $errstr);
+            } else {
+                /* Se escucha en tcp:// aun para TLS: la negociación se maneja
+                 * manualmente tras aceptar, para que stream_socket_accept()
+                 * nunca bloquee el único hilo del servidor. */
+                /* Listening on tcp:// even for TLS: the negotiation is handled
+                 * manually after accepting, so that stream_socket_accept()
+                 * never blocks the server's single thread. */
+                $this->_hEscucha = stream_socket_server($sUrlSocket, $errno, $errstr,
+                    STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $rContextoSSL);
+            }
             if (!$this->_hEscucha) {
                 $this->_oLog->output("ERR: no se puede iniciar socket de escucha $sUrlSocket: ($errno) $errstr");
             } else {
@@ -170,16 +194,30 @@ class MultiplexServer
                     }
                 }
                 if (in_array($conexion['socket'], $listoLeer)) {
-                    // Leer datos de la conexión lista para leer
-                    // Read data from connection ready to read
-                    $sNuevaEntrada = fread($conexion['socket'], 128 * 1024);
-                    if ($sNuevaEntrada == '') {
-                        // Lectura de cadena vacía indica que se ha cerrado la conexión remotamente
-                        // Reading empty string indicates connection has been closed remotely
-                        $this->_cerrarConexion($sKey);
+                    if (!empty($conexion['handshake_pendiente'])) {
+                        // Todavía se está negociando TLS en esta conexión
+                        // TLS is still being negotiated on this connection
+                        $this->_continuarHandshakeTLS($sKey);
                     } else {
-                        $conexion['pendiente_leer'] .= $sNuevaEntrada;
-                        $conexion['nuevos_datos_leer'] = TRUE;
+                        // Leer datos de la conexión lista para leer
+                        // Read data from connection ready to read
+                        $sNuevaEntrada = @fread($conexion['socket'], 128 * 1024);
+                        if ($sNuevaEntrada === FALSE || $sNuevaEntrada === '') {
+                            /* Una lectura vacía sólo indica cierre remoto si el
+                             * socket está en EOF. Sobre TLS, el socket puede
+                             * estar listo para leer teniendo sólo un registro
+                             * TLS parcial, que no produce dato alguno en claro;
+                             * cerrar ahí desconectaría consolas activas. */
+                            /* An empty read only indicates remote closure if the
+                             * socket is at EOF. Over TLS, the socket can be ready
+                             * to read while holding only a partial TLS record,
+                             * which yields no plaintext at all; closing there
+                             * would disconnect live consoles. */
+                            if (feof($conexion['socket'])) $this->_cerrarConexion($sKey);
+                        } else {
+                            $conexion['pendiente_leer'] .= $sNuevaEntrada;
+                            $conexion['nuevos_datos_leer'] = TRUE;
+                        }
                     }
                     $bNuevosDatos = TRUE;
                 }
@@ -198,6 +236,30 @@ class MultiplexServer
             // Remover todos los elementos seteados a FALSE
             // Remove all elements set to FALSE
             $this->_conexiones = array_filter($this->_conexiones);
+        }
+
+        /* Descartar conexiones que abren el socket pero nunca completan la
+         * negociación TLS. Va fuera del bloque anterior para que también se
+         * apliquen cuando el servidor está totalmente inactivo. */
+        /* Discard connections that open the socket but never complete the TLS
+         * negotiation. This goes outside the block above so that it also
+         * applies when the server is completely idle. */
+        if (!is_null($this->_rContextoSSL)) {
+            $iAhora = time();
+            $bCerradoPorTimeout = FALSE;
+            foreach ($this->_conexiones as $sKeyTLS => $conexionTLS) {
+                if (is_array($conexionTLS) && !empty($conexionTLS['handshake_pendiente'])
+                    && $conexionTLS['handshake_limite'] > 0
+                    && $iAhora > $conexionTLS['handshake_limite']) {
+                    $this->_oLog->output('WARN: '.__METHOD__.
+                        ": negociación TLS sin completar a tiempo, se cierra conexión $sKeyTLS".
+                        ' | EN: WARN: '.__METHOD__.
+                        ": TLS negotiation not completed in time, closing connection $sKeyTLS");
+                    $this->_cerrarConexion($sKeyTLS);
+                    $bCerradoPorTimeout = TRUE;
+                }
+            }
+            if ($bCerradoPorTimeout) $this->_conexiones = array_filter($this->_conexiones);
         }
 
         return $bNuevosDatos;
@@ -272,9 +334,59 @@ class MultiplexServer
     // Process a new connection that enters the server
     private function _procesarConexionNueva()
     {
-        $hConexion = stream_socket_accept($this->_hEscucha);
-        $sKey = $this->agregarConexion($hConexion);
-        $this->procesarInicial($sKey);
+        $hConexion = @stream_socket_accept($this->_hEscucha);
+        if ($hConexion === FALSE) return;
+
+        if (is_null($this->_rContextoSSL)) {
+            $sKey = $this->agregarConexion($hConexion);
+            $this->procesarInicial($sKey);
+        } else {
+            /* La conexión no se entrega a la subclase hasta que la negociación
+             * TLS se complete, para que no se escriba nada en claro. */
+            /* The connection is not handed to the subclass until the TLS
+             * negotiation completes, so that nothing is written in the clear. */
+            $sKey = $this->agregarConexion($hConexion, TRUE);
+            $this->_continuarHandshakeTLS($sKey);
+        }
+    }
+
+    /* Avanzar la negociación TLS de una conexión aceptada. El socket es no
+     * bloqueante, así que stream_socket_enable_crypto() puede devolver 0 para
+     * indicar que faltan datos; en ese caso se reintenta cuando el socket
+     * vuelva a tener datos para leer. */
+    /* Advance the TLS negotiation of an accepted connection. The socket is
+     * non-blocking, so stream_socket_enable_crypto() may return 0 to indicate
+     * that more data is required; in that case it is retried when the socket
+     * next has data to read. */
+    private function _continuarHandshakeTLS($sKey)
+    {
+        if (!isset($this->_conexiones[$sKey]) || !is_array($this->_conexiones[$sKey])) return;
+
+        /* Se exige TLS 1.3, cuyas suites son todas AEAD (la negociada es
+         * TLS_AES_256_GCM_SHA384). Sólo se admite TLS 1.2 si la instalación de
+         * PHP/OpenSSL no conoce TLS 1.3. */
+        /* TLS 1.3 is required; all of its suites are AEAD (the negotiated one
+         * is TLS_AES_256_GCM_SHA384). TLS 1.2 is only allowed if this
+         * PHP/OpenSSL installation does not know about TLS 1.3. */
+        $iMetodo = defined('STREAM_CRYPTO_METHOD_TLSv1_3_SERVER')
+            ? STREAM_CRYPTO_METHOD_TLSv1_3_SERVER
+            : STREAM_CRYPTO_METHOD_TLSv1_2_SERVER;
+
+        $r = @stream_socket_enable_crypto($this->_conexiones[$sKey]['socket'], TRUE, $iMetodo);
+        if ($r === TRUE) {
+            // Negociación completa, la conexión ya puede usarse normalmente
+            // Negotiation complete, the connection can now be used normally
+            $this->_conexiones[$sKey]['handshake_pendiente'] = FALSE;
+            $this->_conexiones[$sKey]['handshake_limite'] = 0;
+            $this->procesarInicial($sKey);
+        } elseif ($r === FALSE) {
+            $this->_oLog->output('WARN: '.__METHOD__.
+                ": fallo en negociación TLS, se cierra conexión $sKey".
+                ' | EN: WARN: '.__METHOD__.": TLS negotiation failed, closing connection $sKey");
+            $this->_cerrarConexion($sKey);
+        }
+        // $r === 0: la negociación requiere más datos, se reintenta luego
+        // $r === 0: the negotiation requires more data, retried later
     }
 
     /**
@@ -289,7 +401,7 @@ class MultiplexServer
      * @return Clave a usar para identificar la conexión
      *          Key to use to identify the connection
      */
-    protected function agregarConexion($hConexion)
+    protected function agregarConexion($hConexion, $bHandshakeTLS = FALSE)
     {
         $nuevaConn = array(
             'socket'                =>  $hConexion,
@@ -297,6 +409,8 @@ class MultiplexServer
             'pendiente_escribir'    =>  '',
             'exit_request'          =>  FALSE,
             'nuevos_datos_leer'     =>  FALSE,
+            'handshake_pendiente'   =>  $bHandshakeTLS,
+            'handshake_limite'      =>  $bHandshakeTLS ? (time() + self::TIMEOUT_HANDSHAKE_TLS) : 0,
         );
         stream_set_blocking($nuevaConn['socket'], 0);
 
@@ -343,6 +457,20 @@ class MultiplexServer
     public function encolarDatosEscribir($sKey, &$s)
     {
         if (!isset($this->_conexiones[$sKey])) return;
+        if (!is_string($s)) {
+            /* Un FALSE aqui viene tipicamente de un asXML() que fallo. Al
+             * concatenarlo se convierte en cadena vacia y la respuesta o el
+             * evento desaparecen sin dejar rastro; se reporta en vez de
+             * perderse en silencio. */
+            /* A FALSE here typically comes from a failed asXML(). Concatenating
+             * it turns it into an empty string and the response or event
+             * vanishes without a trace; report it instead of losing it
+             * silently. */
+            $this->_oLog->output('ERR: '.__METHOD__.": datos a escribir para $sKey no son".
+                ' una cadena ('.gettype($s).'), no se escribe nada. | EN: ERR: '.__METHOD__.
+                ": data to write for $sKey is not a string (".gettype($s).'), nothing written.');
+            return;
+        }
         $this->_conexiones[$sKey]['pendiente_escribir'] .= $s;
     }
 

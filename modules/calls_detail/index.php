@@ -327,13 +327,14 @@ function reportCallsDetail($smarty, $module_name, $pDB, $local_templates_dir)
         $counterHtml = '<tr><th colspan="'.count($arrColumnas).'" style="text-align:center; border-bottom:2px solid #ccc; padding:8px 0; border-radius:6px 6px 0 0;"><span style="font-size:13px; color:white;"><span style="font-weight:bold;">'._tr('Total: ').'</span>'.$total.' '._tr('Calls').'</span></th></tr>';
         $gridContent = preg_replace('/(<thead>)/', '<thead>$1'.$counterHtml, $gridContent);
 
-        // Add CSS and JavaScript for audio player, and modal
-        $cssUrl = "modules/$module_name/themes/default/css/styles.css";
-        $jsUrl = "modules/$module_name/themes/default/js/javascript.js";
-
+        /* The module's themes/default/js/*.js and themes/default/css/*.css are
+         * already injected into <head> by paloSantoNavigation::putHEAD_MODULE_HTML()
+         * (libs/paloSantoNavigation.class.php). Emitting them again here made the
+         * browser run javascript.js twice, which bound the recordings expand/collapse
+         * handler twice: the two handlers toggled the same class on one click and
+         * cancelled each other out, so the extra recordings never became visible.
+         * Only the modal markup belongs here. */
         $modalHtml = <<<MODAL
-<link rel="stylesheet" type="text/css" href="$cssUrl">
-<script type="text/javascript" src="$jsUrl"></script>
 <!-- The Modal -->
 <div id="myModal" class="modal">
   <div id="single-song-player">
@@ -409,13 +410,14 @@ MODAL;
         $counterHtml = '<tr><th colspan="'.count($arrColumnas).'" style="text-align:center; border-bottom:2px solid #ccc; padding:8px 0; border-radius:6px 6px 0 0;"><span style="font-size:13px; color:white;"><span style="font-weight:bold;">'._tr('Total: ').'</span>'.$total.' '._tr('Calls').'</span></th></tr>';
         $sContenido = preg_replace('/(<thead>)/', '<thead>$1'.$counterHtml, $sContenido);
 
-        // Add CSS and JavaScript for audio player, and modal
-        $cssUrl = "modules/$module_name/themes/default/css/styles.css";
-        $jsUrl = "modules/$module_name/themes/default/js/javascript.js";
-
+        /* The module's themes/default/js/*.js and themes/default/css/*.css are
+         * already injected into <head> by paloSantoNavigation::putHEAD_MODULE_HTML()
+         * (libs/paloSantoNavigation.class.php). Emitting them again here made the
+         * browser run javascript.js twice, which bound the recordings expand/collapse
+         * handler twice: the two handlers toggled the same class on one click and
+         * cancelled each other out, so the extra recordings never became visible.
+         * Only the modal markup belongs here. */
         $modalHtml = <<<MODAL
-<link rel="stylesheet" type="text/css" href="$cssUrl">
-<script type="text/javascript" src="$jsUrl"></script>
 <!-- The Modal -->
 <div id="myModal" class="modal">
   <div id="single-song-player">

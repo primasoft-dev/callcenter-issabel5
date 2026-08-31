@@ -382,8 +382,18 @@ SQL_OUTGOING;
              * intento de llamada en la columna 11. */
             /* EN: It is assumed that call type is in column 7 and call attempt */
             /* EN: ID is in column 11. */
+            /* Ascending: a transferred call is recorded in one file per leg, and
+             * the grid shows the first row expanded and collapses the rest. In
+             * descending order that put the last leg on top, so the visible
+             * recording was the part after the transfer instead of the start of
+             * the call.
+             * ES: Ascendente: una llamada transferida se graba en un archivo por
+             * tramo, y la grilla muestra la primera fila expandida y colapsa el
+             * resto. En orden descendente eso dejaba arriba el ultimo tramo, asi
+             * que la grabacion visible era la parte posterior a la transferencia
+             * en vez del inicio de la llamada. */
             $sql = 'SELECT id, datetime_entry FROM call_recording WHERE '.
-                $sqlfield[$recordset[$i][7]].' = ? ORDER BY datetime_entry DESC';
+                $sqlfield[$recordset[$i][7]].' = ? ORDER BY datetime_entry ASC, id ASC';
             $r2 = $this->_DB->fetchTable($sql, TRUE, array($recordset[$i][11]));
             if (!is_array($r2)) {
                 $this->errMsg = '(internal) Failed to fetch recordings for CDRs - '.$this->_DB->errMsg;

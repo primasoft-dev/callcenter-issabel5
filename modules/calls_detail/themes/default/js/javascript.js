@@ -1,10 +1,17 @@
 $(document).ready(function() {
-    $('div.callcenter-recordings > div:first-child').click(function () {
-        // Ocultar o mostrar items según la clase
-        if ($(this).parent().hasClass('collapsed'))
-            $(this).parent().removeClass('collapsed');
-        else $(this).parent().addClass('collapsed');
-    });
+    /* Namespaced, and unbound first, so that a second execution of this file
+     * replaces the handler instead of adding another one. Two handlers on the
+     * same element toggled the class twice per click and cancelled out.
+     * ES: Con espacio de nombres, y se desasocia primero, para que una segunda
+     * ejecucion de este archivo reemplace el manejador en vez de agregar otro.
+     * Dos manejadores en el mismo elemento alternaban la clase dos veces por
+     * clic y se anulaban entre si. */
+    $('div.callcenter-recordings > div:first-child')
+        .off('click.ccrecordings')
+        .on('click.ccrecordings', function () {
+            // Ocultar o mostrar items segun la clase | EN: hide or show items by class
+            $(this).parent().toggleClass('collapsed');
+        });
 
     // Close when clicking outside modal
     window.onclick = function(event) {

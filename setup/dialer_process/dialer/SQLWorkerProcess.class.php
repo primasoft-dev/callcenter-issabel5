@@ -73,6 +73,28 @@ class SQLWorkerProcess extends TuberiaProcess
 
     private $_finalizandoPrograma = FALSE;
 
+    /* Estado de reintento de la acción que encabeza la cola. Garantiza que una
+     * acción que jamás podrá completarse no bloquee la cola de forma permanente
+     * (head-of-line blocking) ni genere un ciclo de reintento sin pausa. Sin este
+     * control, un solo fallo permanente impide que se emitan los eventos ECCP y las
+     * consolas de agente dejan de actualizarse.
+     *
+     * Retry state for the action at the head of the queue. Guarantees that an action
+     * that can never complete does not block the queue permanently (head-of-line
+     * blocking) nor generate a retry cycle without pause. Without this control, a
+     * single permanent failure prevents ECCP events from being emitted and the agent
+     * consoles stop updating. */
+    const MAX_ACTION_RETRIES = 50;          // Reintentos antes de descartar | Retries before discarding
+    const BACKOFF_CAP_SECONDS = 30;         // Tope de la espera creciente | Cap of the increasing wait
+    const LOG_REPEAT_WINDOW_SECONDS = 60;   // Ventana anti-inundación de log | Log anti-flood window
+    const FAST_RETRIES_ON_CONTENTION = 5;   // Reintentos inmediatos ante contención | Immediate retries on contention
+
+    private $_iReintentosAccion = 0;    // Reintentos de la acción actual | Retries of the current action
+    private $_tsProximoReintento = 0;   // Instante del próximo intento | Timestamp of the next attempt
+    private $_sUltimoErrorFirma = NULL; // Firma del último error registrado | Signature of last logged error
+    private $_tsUltimoErrorLog = 0;     // Instante del último registro | Timestamp of the last log entry
+    private $_iErroresSuprimidos = 0;   // Errores idénticos suprimidos | Identical errors suppressed
+
     public function inicioPostDemonio($infoConfig, &$oMainLog)
     {
     	$this->_log = $oMainLog;
@@ -162,7 +184,7 @@ class SQLWorkerProcess extends TuberiaProcess
         if (isset($infoConfig['database']) && isset($infoConfig['database']['dbpass']))
             $dbPass = $infoConfig['database']['dbpass'];
 
-        return array("mysql:host=$dbHost;dbname=call_center", $dbUser, $dbPass);
+        return array("mysql:host=$dbHost;dbname=call_center;charset=utf8mb4", $dbUser, $dbPass);
     }
 
     private function _iniciarConexionDB()
@@ -184,7 +206,14 @@ class SQLWorkerProcess extends TuberiaProcess
         // Lo siguiente NO debe de iniciar operaciones DB, sólo acumular acciones
         // The following must NOT initiate DB operations, only accumulate actions
         $bPaqProcesados = $this->_multiplex->procesarPaquetes();
-        $this->_multiplex->procesarActividad(($bPaqProcesados || (count($this->_accionesPendientes) > 0)) ? 0 : 1);
+        /* Si la acción que encabeza la cola está esperando su reintento, el proceso
+         * debe quedar ocioso en lugar de girar sin pausa consumiendo CPU y llenando
+         * el log.
+         *
+         * If the action at the head of the queue is waiting for its retry, the process
+         * must go idle instead of spinning without pause, consuming CPU and filling
+         * up the log. */
+        $this->_multiplex->procesarActividad(($bPaqProcesados || $this->_hayAccionEjecutable()) ? 0 : 1);
 
         // Verificar posible desconexión de la base de datos
         // Verify possible database disconnection
@@ -216,8 +245,21 @@ class SQLWorkerProcess extends TuberiaProcess
         return TRUE;
     }
 
-    private function _procesarUnaAccion()
+    /* $bIgnorarBackoff fuerza el intento aunque la acción esté en espera de
+     * reintento. Lo usa limpiezaDemonio(), que dispone de un plazo acotado para
+     * vaciar la cola y no debe desperdiciarlo esperando.
+     *
+     * $bIgnorarBackoff forces the attempt even if the action is waiting for a retry.
+     * It is used by limpiezaDemonio(), which has a bounded window to drain the queue
+     * and must not waste it waiting. */
+    private function _procesarUnaAccion($bIgnorarBackoff = FALSE)
     {
+        /* Distingue si la excepción proviene de la acción encolada o de las
+         * verificaciones periódicas previas, que no forman parte de ella.
+         *
+         * Distinguishes whether the exception comes from the queued action or from
+         * the preceding periodic checks, which are not part of it. */
+        $bEjecutandoAccion = FALSE;
         try {
             if (!$this->_finalizandoPrograma) {
                 // Verificar si se ha cambiado la configuración
@@ -234,12 +276,14 @@ class SQLWorkerProcess extends TuberiaProcess
              *
              * For now, all operations are attempted to be executed, even if
              * the program is being finalized. */
-            if (count($this->_accionesPendientes) > 0) {
+            if (count($this->_accionesPendientes) > 0 &&
+                ($bIgnorarBackoff || $this->_hayAccionEjecutable())) {
                 if ($this->DEBUG) {
                     $this->_volcarAccion($this->_accionesPendientes[0]);
                 }
 
                 $t_1 = microtime(TRUE);
+                $bEjecutandoAccion = TRUE;
                 $this->_db->beginTransaction();
 
                 $eventos = call_user_func_array(
@@ -253,6 +297,7 @@ class SQLWorkerProcess extends TuberiaProcess
                  * The commit can also throw exceptions. Must go past the commit
                  * before removing the pending action and launching the events. */
                 $this->_db->commit();
+                $bEjecutandoAccion = FALSE;
                 $t_2 = microtime(TRUE);
                 if ($this->DEBUG) {
                     $this->_log->output('DEBUG: '.__METHOD__.' acción ejecutada correctamente. | EN: action executed correctly.');
@@ -264,30 +309,209 @@ class SQLWorkerProcess extends TuberiaProcess
                 }
 
                 array_shift($this->_accionesPendientes);
+                $this->_reiniciarEstadoReintento();
                 $this->_lanzarEventos($eventos);
             }
         } catch (PDOException $e) {
-            if ($this->DEBUG || !esReiniciable($e)) {
-                $this->_log->output('ERR: '.__METHOD__.
-                    ': no se puede realizar operación de base de datos: '.
-                    implode(' - ', $e->errorInfo).' | EN: cannot perform database operation: '.
-                    implode(' - ', $e->errorInfo));
-                $this->_log->output("ERR: traza de pila: \n".$e->getTraceAsString()." | EN: stack trace: \n".$e->getTraceAsString());
-            }
-            if ($e->errorInfo[0] == 'HY000' && $e->errorInfo[1] == 2006) {
-                // Códigos correspondientes a pérdida de conexión de base de datos
-                // Codes corresponding to database connection loss
-                $this->_log->output('WARN: '.__METHOD__.
-                    ': conexión a DB parece ser inválida, se cierra... | EN: DB connection appears invalid, closing...');
-                $this->_db = NULL;
-            } else {
-                $this->_db->rollBack();
-            }
+            $this->_manejarErrorAccion($e, $bEjecutandoAccion);
         }
     }
 
-    private function _volcarAccion(&$accion)
+    /* Clasifica el fallo de base de datos y decide el destino de la acción encolada:
+     *
+     *   1. Pérdida de conexión  -> se conserva la acción y se cierra la conexión.
+     *   2. Contención transitoria (interbloqueo, timeout de lock) -> reintento inmediato.
+     *   3. Fallo lógico permanente -> se descarta la acción; reintentar es inútil.
+     *   4. Cualquier otro error  -> reintento con espera creciente y descarte tras
+     *      MAX_ACTION_RETRIES, de modo que ningún error imprevisto pueda bloquear la
+     *      cola de forma permanente.
+     *
+     * Classifies the database failure and decides the fate of the queued action:
+     *
+     *   1. Connection loss       -> the action is retained and the connection closed.
+     *   2. Transient contention (deadlock, lock timeout) -> immediate retry.
+     *   3. Permanent logical failure -> the action is discarded; retrying is useless.
+     *   4. Any other error       -> retry with increasing backoff and discard after
+     *      MAX_ACTION_RETRIES, so that no unforeseen error can block the queue
+     *      permanently. */
+    private function _manejarErrorAccion(PDOException $e, $bEjecutandoAccion)
     {
+        $info = infoErrorPDO($e);
+        $sError = implode(' - ', $info);
+
+        /* Categoría 1: la conexión ya no sirve. La acción DEBE conservarse; se cierra
+         * la conexión para que procedimientoDemonio() la restablezca y reintente.
+         *
+         * Category 1: the connection is no longer usable. The action MUST be retained;
+         * the connection is closed so procedimientoDemonio() restores it and retries. */
+        if (esErrorConexion($e)) {
+            $this->_log->output('WARN: '.__METHOD__.
+                ': conexión a DB perdida ('.$sError.'), se conservan '.
+                count($this->_accionesPendientes).' acciones pendientes... | EN: DB connection lost ('.
+                $sError.'), retaining '.count($this->_accionesPendientes).' pending actions...');
+            $this->_db = NULL;
+            return;
+        }
+
+        /* rollBack() arroja excepción si no hay transacción activa, lo que ocurre
+         * cuando el fallo proviene de una lectura hecha fuera de transacción. Sin
+         * esta guarda, esa segunda excepción escaparía del catch y abortaría el
+         * proceso.
+         *
+         * rollBack() throws an exception if there is no active transaction, which
+         * happens when the failure comes from a read performed outside a transaction.
+         * Without this guard, that second exception would escape the catch and abort
+         * the process. */
+        if (!is_null($this->_db)) {
+            try {
+                if ($this->_db->inTransaction()) $this->_db->rollBack();
+            } catch (PDOException $e2) {
+                $this->_log->output('WARN: '.__METHOD__.
+                    ': fallo al deshacer la transacción, se cierra la conexión: '.$e2->getMessage().
+                    ' | EN: failed to roll back the transaction, closing the connection: '.$e2->getMessage());
+                $this->_db = NULL;
+                return;
+            }
+        }
+
+        /* El fallo puede provenir de _verificarCambioConfiguracion() o de
+         * _verificarActualizacionAgentes(). En ese caso la acción encolada es inocente
+         * y descartarla perdería datos que nunca se llegaron a intentar.
+         *
+         * The failure may come from _verificarCambioConfiguracion() or
+         * _verificarActualizacionAgentes(). In that case the queued action is innocent
+         * and discarding it would lose data that was never even attempted. */
+        if (!$bEjecutandoAccion) {
+            if ($this->_debeRegistrarError('cfg-'.$info[0].'-'.$info[1])) {
+                $this->_log->output('ERR: '.__METHOD__.
+                    ': fallo de base de datos fuera de la acción encolada: '.$sError.
+                    ' | EN: database failure outside the queued action: '.$sError);
+            }
+            return;
+        }
+
+        /* Categoría 3: el error nunca podrá resolverse solo. Se registra una vez, junto
+         * con los datos que no pudieron persistirse, y se descarta para desbloquear la
+         * cola.
+         *
+         * Category 3: the error can never resolve by itself. It is logged once, along
+         * with the data that could not be persisted, and discarded to unblock the
+         * queue. */
+        if (esErrorPermanente($e)) {
+            $accion = array_shift($this->_accionesPendientes);
+            $this->_reiniciarEstadoReintento();
+            $this->_log->output('ERR: '.__METHOD__.
+                ': acción descartada permanentemente, el error nunca podrá resolverse: '.$sError.
+                ' | EN: action permanently discarded, the error can never be resolved: '.$sError);
+            $this->_volcarAccion($accion, TRUE);
+            return;
+        }
+
+        // Categorías 2 y 4: se conserva la acción y se reintenta.
+        // Categories 2 and 4: the action is retained and retried.
+        $this->_iReintentosAccion++;
+        if ($this->_iReintentosAccion >= self::MAX_ACTION_RETRIES) {
+            $accion = array_shift($this->_accionesPendientes);
+            $this->_reiniciarEstadoReintento();
+            $this->_log->output('ERR: '.__METHOD__.
+                ': acción descartada tras '.self::MAX_ACTION_RETRIES.' reintentos fallidos: '.$sError.
+                ' | EN: action discarded after '.self::MAX_ACTION_RETRIES.' failed retries: '.$sError);
+            $this->_volcarAccion($accion, TRUE);
+            return;
+        }
+
+        if (esReiniciable($e)) {
+            /* Los interbloqueos se resuelven en milisegundos: los primeros intentos se
+             * repiten de inmediato y sin registrar, para no ensuciar el log con un
+             * evento normal. Si la contención persiste se aplica la misma espera
+             * creciente, de modo que el tope de reintentos abarque un lapso útil en
+             * lugar de agotarse en microsegundos.
+             *
+             * Deadlocks resolve within milliseconds: the first attempts are repeated
+             * immediately and without logging, so as not to pollute the log with a
+             * normal event. If the contention persists, the same increasing wait is
+             * applied, so that the retry cap spans a useful period instead of being
+             * exhausted within microseconds. */
+            $this->_tsProximoReintento = ($this->_iReintentosAccion <= self::FAST_RETRIES_ON_CONTENTION)
+                ? 0
+                : time() + min(pow(2, $this->_iReintentosAccion - self::FAST_RETRIES_ON_CONTENTION),
+                               self::BACKOFF_CAP_SECONDS);
+            if ($this->DEBUG) {
+                $this->_log->output('DEBUG: '.__METHOD__.
+                    ': contención transitoria, reintento '.$this->_iReintentosAccion.': '.$sError.
+                    ' | EN: transient contention, retry '.$this->_iReintentosAccion.': '.$sError);
+            }
+            return;
+        }
+
+        $iEspera = min(pow(2, min($this->_iReintentosAccion, 10)), self::BACKOFF_CAP_SECONDS);
+        $this->_tsProximoReintento = time() + $iEspera;
+        if ($this->_debeRegistrarError($info[0].'-'.$info[1])) {
+            $this->_log->output('ERR: '.__METHOD__.
+                ': no se puede realizar la operación de base de datos (reintento '.
+                $this->_iReintentosAccion.' de '.self::MAX_ACTION_RETRIES.', espera '.$iEspera.' s): '.$sError.
+                ' | EN: cannot perform the database operation (retry '.
+                $this->_iReintentosAccion.' of '.self::MAX_ACTION_RETRIES.', waiting '.$iEspera.' s): '.$sError);
+            $this->_log->output('ERR: traza de pila | EN: stack trace: '."\n".$e->getTraceAsString());
+        }
+    }
+
+    /* Indica si hay una acción lista para ejecutarse: la cola no está vacía y la
+     * acción que la encabeza ya cumplió su espera de reintento.
+     *
+     * Indicates whether there is an action ready to run: the queue is not empty and
+     * the action heading it has already served its retry wait. */
+    private function _hayAccionEjecutable()
+    {
+        return (count($this->_accionesPendientes) > 0 &&
+                time() >= $this->_tsProximoReintento);
+    }
+
+    private function _reiniciarEstadoReintento()
+    {
+        $this->_iReintentosAccion = 0;
+        $this->_tsProximoReintento = 0;
+    }
+
+    /* Evita que un error repetido inunde el log. Registra la primera aparición y
+     * luego, a lo sumo, una vez por ventana, informando cuántas se suprimieron.
+     *
+     * Prevents a repeated error from flooding the log. Logs the first occurrence and
+     * then at most once per window, reporting how many were suppressed. */
+    private function _debeRegistrarError($sFirma)
+    {
+        $iAhora = time();
+        if ($sFirma === $this->_sUltimoErrorFirma &&
+            $iAhora - $this->_tsUltimoErrorLog < self::LOG_REPEAT_WINDOW_SECONDS) {
+            $this->_iErroresSuprimidos++;
+            return FALSE;
+        }
+        if ($this->_iErroresSuprimidos > 0) {
+            $this->_log->output('WARN: se suprimieron '.$this->_iErroresSuprimidos.
+                ' errores idénticos en los últimos '.self::LOG_REPEAT_WINDOW_SECONDS.
+                ' s | EN: suppressed '.$this->_iErroresSuprimidos.
+                ' identical errors in the last '.self::LOG_REPEAT_WINDOW_SECONDS.' s');
+            $this->_iErroresSuprimidos = 0;
+        }
+        $this->_sUltimoErrorFirma = $sFirma;
+        $this->_tsUltimoErrorLog = $iAhora;
+        return TRUE;
+    }
+
+    /* $bForzar registra la acción aunque la depuración esté desactivada. Se usa al
+     * descartar una acción, para no perder el dato que no pudo persistirse.
+     *
+     * $bForzar logs the action even if debugging is disabled. It is used when
+     * discarding an action, so as not to lose the data that could not be persisted. */
+    private function _volcarAccion($accion, $bForzar = FALSE)
+    {
+        if (!$this->DEBUG && !$bForzar) return;
+        /* array_shift() devuelve NULL si la cola estaba vacía. No debería ocurrir en
+         * el flujo normal, pero se comprueba para no emitir un aviso de PHP.
+         *
+         * array_shift() returns NULL if the queue was empty. This should not happen in
+         * the normal flow, but it is checked so as not to emit a PHP notice. */
+        if (!is_array($accion)) return;
         $this->_log->output('DEBUG: acción pendiente '.$accion[0][1].': '.print_r($accion[1], TRUE).' | EN: pending action '.$accion[0][1].': ');
     }
 
@@ -314,7 +538,12 @@ class SQLWorkerProcess extends TuberiaProcess
         $t1 = time();
         while (time() - $t1 < 10 && !is_null($this->_db) &&
             count($this->_accionesPendientes) > 0) {
-            $this->_procesarUnaAccion();
+            /* Se ignora la espera de reintento: el cierre dispone de 10 s para vaciar
+             * la cola y no debe desperdiciarlos esperando.
+             *
+             * The retry wait is ignored: shutdown has 10 s to drain the queue and must
+             * not waste them waiting. */
+            $this->_procesarUnaAccion(TRUE);
 
             // No se hace I/O y por lo tanto no se lanzan eventos
             // No I/O is done and therefore no events are launched
@@ -597,10 +826,6 @@ class SQLWorkerProcess extends TuberiaProcess
                 } elseif (preg_match('/^(\w+)\s*=\s*(.*)/', trim($s), $regs)) {
                     if (in_array($regs[1], array('eventmemberstatus', 'eventwhencalled'))) {
                         $queueflags[$queue][$regs[1]] = in_array($regs[2], array('yes', 'true', 'y', 't', 'on', '1'));
-                    } elseif ($regs[1] == 'member' && (stripos($regs[2], 'SIP/') === 0 || stripos($regs[2], 'IAX2/') === 0)) {
-                        $this->_log->output('WARN: '.__METHOD__.': agente estático '.
-                            $regs[2].' encontrado en cola '.$queue.' - puede causar problemas. | EN: static agent '.
-                            $regs[2].' found in queue '.$queue.' - may cause problems.');
                     }
                 }
             }
@@ -1175,8 +1400,16 @@ SQL_EXISTE_AUDIT;
     private function _construirEventoProgresoLlamada($prop)
     {
 // CUSTOMIZATIONS WC 05/08/2025
-	$temp_data=var_export($prop,true);
-        $this->_log->output('LOGDATA: '.$temp_data);
+        /* Se registra bajo depuración únicamente. Esta traza se emite una vez por cada
+         * cambio de estado de llamada, de modo que sin la guarda queda activa de forma
+         * permanente en producción.
+         *
+         * Logged under debugging only. This trace is emitted once per call state
+         * change, so without the guard it stays permanently active in production. */
+        if ($this->DEBUG) {
+            $temp_data=var_export($prop,true);
+            $this->_log->output('LOGDATA: '.$temp_data);
+        }
 // CUSTOMIZATIONS WC 05/08/2025
         $id_campaignlog = NULL;
         $ev = NULL;

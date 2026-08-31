@@ -354,7 +354,7 @@ class Agente
     {
         if (!$this->_reservado) {
             $this->_reservado = TRUE;
-            $this->_incrementarPausas($ami);
+            $this->_incrementarPausas($ami, NULL, 'Reserved');
         }
         $this->resetTimeout();
     }

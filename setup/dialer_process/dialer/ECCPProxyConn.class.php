@@ -22,6 +22,8 @@
   +----------------------------------------------------------------------+
   $Id: ECCPProxyConn.class.php,v 1.48 2009/03/26 13:46:58 alex Exp $ */
 
+require_once 'ECCPHelper.lib.php';
+
 class ECCPProxyConn extends MultiplexConn
 {
     private $_log;
@@ -158,7 +160,7 @@ class ECCPProxyConn extends MultiplexConn
     {
         $failureTag = $x->addChild("failure");
         $failureTag->addChild("code", $iCodigo);
-        $failureTag->addChild("message", str_replace('&', '&amp;', $sMensaje));
+        $failureTag->addChild("message", xmlSafe($sMensaje));
     }
 
     // Procedimiento a llamar cuando se finaliza la conexión en cierre normal
@@ -257,7 +259,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_agentLoggedIn = $bExitoLogin
             ? $xml_response->addChild('agentloggedin')
             : $xml_response->addChild('agentfailedlogin');
-        $xml_agentLoggedIn->addChild('agent', str_replace('&', '&amp;', $sAgente));
+        $xml_agentLoggedIn->addChild('agent', xmlSafe($sAgente));
 
         $s = $xml_response->asXML();
         $this->multiplexSrv->encolarDatosEscribir($this->sKey, $s);
@@ -270,7 +272,7 @@ class ECCPProxyConn extends MultiplexConn
 
         $xml_response = new SimpleXMLElement('<event />');
         $xml_agentLoggedIn = $xml_response->addChild('agentloggedout');
-        $xml_agentLoggedIn->addChild('agent', str_replace('&', '&amp;', $sAgente));
+        $xml_agentLoggedIn->addChild('agent', xmlSafe($sAgente));
 
         $s = $xml_response->asXML();
         $this->multiplexSrv->encolarDatosEscribir($this->sKey, $s);
@@ -300,7 +302,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_agentLinked = $xml_response->addChild('agentunlinked');
         $infoLlamada['agent_number'] = $sAgente;
         foreach ($infoLlamada as $sKey => $valor) {
-            if (!is_null($valor)) $xml_agentLinked->addChild($sKey, str_replace('&', '&amp;', $valor));
+            if (!is_null($valor)) $xml_agentLinked->addChild($sKey, xmlSafe($valor));
         }
 
         $s = $xml_response->asXML();
@@ -316,7 +318,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_agentLinked = $xml_response->addChild('pausestart');
         $infoPausa['agent_number'] = $sAgente;
         foreach ($infoPausa as $sKey => $valor) {
-            if (!is_null($valor)) $xml_agentLinked->addChild($sKey, str_replace('&', '&amp;', $valor));
+            if (!is_null($valor)) $xml_agentLinked->addChild($sKey, xmlSafe($valor));
         }
 
         $s = $xml_response->asXML();
@@ -332,7 +334,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_agentLinked = $xml_response->addChild('pauseend');
         $infoPausa['agent_number'] = $sAgente;
         foreach ($infoPausa as $sKey => $valor) {
-            if (!is_null($valor)) $xml_agentLinked->addChild($sKey, str_replace('&', '&amp;', $valor));
+            if (!is_null($valor)) $xml_agentLinked->addChild($sKey, xmlSafe($valor));
         }
 
         $s = $xml_response->asXML();
@@ -347,7 +349,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_response = new SimpleXMLElement('<event />');
         $xml_callProgress = $xml_response->addChild('callprogress');
         foreach ($infoProgreso as $sKey => $valor) {
-            if (!is_null($valor)) $xml_callProgress->addChild($sKey, str_replace('&', '&amp;', $valor));
+            if (!is_null($valor)) $xml_callProgress->addChild($sKey, xmlSafe($valor));
         }
 
         $s = $xml_response->asXML();
@@ -362,11 +364,11 @@ class ECCPProxyConn extends MultiplexConn
         $xml_response = new SimpleXMLElement('<event />');
         $xml_queueMembership = $xml_response->addChild('queuemembership');
 
-        $xml_queueMembership->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+        $xml_queueMembership->addChild('agent_number', xmlSafe($sAgente));
         ECCPConn::getcampaignstatus_setagent($xml_queueMembership, $infoSeguimiento);
         $xml_agentQueues = $xml_queueMembership->addChild('queues');
         foreach ($listaColas as $sCola) {
-            $xml_agentQueues->addChild('queue', str_replace('&', '&amp;', $sCola));
+            $xml_agentQueues->addChild('queue', xmlSafe($sCola));
         }
         $s = $xml_response->asXML();
         $this->multiplexSrv->encolarDatosEscribir($this->sKey, $s);
@@ -380,9 +382,9 @@ class ECCPProxyConn extends MultiplexConn
         $xml_response = new SimpleXMLElement('<event />');
         $xml_stateChange = $xml_response->addChild('agentstatechange');
 
-        $xml_stateChange->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+        $xml_stateChange->addChild('agent_number', xmlSafe($sAgente));
         $xml_stateChange->addChild('status', $sNewStatus);
-        $xml_stateChange->addChild('queue', str_replace('&', '&amp;', $sQueue));
+        $xml_stateChange->addChild('queue', xmlSafe($sQueue));
 
         $s = $xml_response->asXML();
         $this->multiplexSrv->encolarDatosEscribir($this->sKey, $s);
@@ -396,7 +398,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_response = new SimpleXMLElement('<event />');
         $xml_recordingMute = $xml_response->addChild('recordingmute');
 
-        $xml_recordingMute->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+        $xml_recordingMute->addChild('agent_number', xmlSafe($sAgente));
         $xml_recordingMute->addChild('calltype', $sTipoLlamada);
         if (!is_null($idCampaign)) $xml_recordingMute->addChild('campaign_id', $idCampaign);
         $xml_recordingMute->addChild('call_id', $idLlamada);
@@ -413,7 +415,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_response = new SimpleXMLElement('<event />');
         $xml_recordingUnmute = $xml_response->addChild('recordingunmute');
 
-        $xml_recordingUnmute->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+        $xml_recordingUnmute->addChild('agent_number', xmlSafe($sAgente));
         $xml_recordingUnmute->addChild('calltype', $sTipoLlamada);
         if (!is_null($idCampaign)) $xml_recordingUnmute->addChild('campaign_id', $idCampaign);
         $xml_recordingUnmute->addChild('call_id', $idLlamada);
@@ -430,7 +432,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_response = new SimpleXMLElement('<event />');
         $xml_scheduleCallStart = $xml_response->addChild('schedulecallstart');
 
-        $xml_scheduleCallStart->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+        $xml_scheduleCallStart->addChild('agent_number', xmlSafe($sAgente));
         $xml_scheduleCallStart->addChild('calltype', $sTipoLlamada);
         if (!is_null($idCampaign)) $xml_scheduleCallStart->addChild('campaign_id', $idCampaign);
         $xml_scheduleCallStart->addChild('call_id', $idLlamada);
@@ -447,7 +449,7 @@ class ECCPProxyConn extends MultiplexConn
         $xml_response = new SimpleXMLElement('<event />');
         $xml_scheduleCallFailed = $xml_response->addChild('schedulecallfailed');
 
-        $xml_scheduleCallFailed->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+        $xml_scheduleCallFailed->addChild('agent_number', xmlSafe($sAgente));
         $xml_scheduleCallFailed->addChild('calltype', $sTipoLlamada);
         if (!is_null($idCampaign)) $xml_scheduleCallFailed->addChild('campaign_id', $idCampaign);
         $xml_scheduleCallFailed->addChild('call_id', $idLlamada);
@@ -463,19 +465,39 @@ class ECCPProxyConn extends MultiplexConn
 
         $xml_response = new SimpleXMLElement('<event />');
         $xml_consultStart = $xml_response->addChild('consultationstart');
-        $xml_consultStart->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+        $xml_consultStart->addChild('agent_number', xmlSafe($sAgente));
 
         $this->multiplexSrv->encolarDatosEscribir($this->sKey, $xml_response->asXML());
     }
 
-    function notificarEvento_ConsultationEnd($sAgente)
+    // $sReason: DIALSTATUS of the consult Dial() (BUSY/NOANSWER/CONGESTION/
+    // CHANUNAVAIL/...) when the consultation ended on its own, empty for any
+    // other way it can end (explicit cancel, completion, hangups).
+    function notificarEvento_ConsultationEnd($sAgente, $sReason = '')
     {
         if (is_null($this->_sUsuarioECCP)) return;
         if (!is_null($this->_sAgenteFiltrado) && $this->_sAgenteFiltrado != $sAgente) return;
 
         $xml_response = new SimpleXMLElement('<event />');
         $xml_consultEnd = $xml_response->addChild('consultationend');
-        $xml_consultEnd->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+        $xml_consultEnd->addChild('agent_number', xmlSafe($sAgente));
+        if ($sReason !== '') {
+            $xml_consultEnd->addChild('reason', xmlSafe($sReason));
+        }
+
+        $this->multiplexSrv->encolarDatosEscribir($this->sKey, $xml_response->asXML());
+    }
+
+    // The consultation's colleague has answered - the agent console can now
+    // offer to complete the transfer (as opposed to only cancel it).
+    function notificarEvento_ConsultationAnswered($sAgente)
+    {
+        if (is_null($this->_sUsuarioECCP)) return;
+        if (!is_null($this->_sAgenteFiltrado) && $this->_sAgenteFiltrado != $sAgente) return;
+
+        $xml_response = new SimpleXMLElement('<event />');
+        $xml_consultAnswered = $xml_response->addChild('consultationanswered');
+        $xml_consultAnswered->addChild('agent_number', xmlSafe($sAgente));
 
         $this->multiplexSrv->encolarDatosEscribir($this->sKey, $xml_response->asXML());
     }

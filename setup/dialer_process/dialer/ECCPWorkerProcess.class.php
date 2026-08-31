@@ -122,7 +122,7 @@ class ECCPWorkerProcess extends TuberiaProcess
         if (isset($infoConfig['database']) && isset($infoConfig['database']['dbpass']))
             $dbPass = $infoConfig['database']['dbpass'];
 
-        return array("mysql:host=$dbHost;dbname=call_center", $dbUser, $dbPass);
+        return array("mysql:host=$dbHost;dbname=call_center;charset=utf8mb4", $dbUser, $dbPass);
     }
 
     private function _iniciarConexionDB()

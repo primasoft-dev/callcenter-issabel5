@@ -11,6 +11,13 @@ var schedule_call_error_msg_missing_date = '';
 var estadoCliente =
 {
 	onhold:		false,	// VERDADERO si el sistema está en hold
+	// Estado de la consulta de transferencia atendida: none/ringing/answered.
+	// Se reenvía al servidor en cada poll para poder resincronizar el botón
+	// Hangup si se perdió un evento Consultation*.
+	// EN: attended-transfer consultation state: none/ringing/answered. Echoed
+	// back to the server on every poll so the Hangup button can be resynced if
+	// a Consultation* event was missed.
+	consultation: 'none',
 	break_id:	null,	// Si != null, el ID del break en que está el agente
 	calltype:	null,	// Si != null, tipo de llamada incoming/outgoing
 	campaign_id:null,	// ID de la campaña a que pertenece la llamada atendida
@@ -39,6 +46,12 @@ var origShiftLogin = 0;     // Original seconds from server
 var origShiftBreak = 0;
 var origShiftHold = 0;
 var isHoldPause = false;    // True if current pause is hold-type
+var lblHangupDefault = null;      // #btn_hangup's normal label, captured at init
+var lblCompleteTransfer = null;   // Set from server-side translation in agent_console.tpl
+var lblCancelTransfer = null;     // Set from server-side translation in agent_console.tpl
+var msgTransferBusy = null;        // Set from server-side translation in agent_console.tpl
+var msgTransferNoAnswer = null;    // Set from server-side translation in agent_console.tpl
+var msgTransferUnavailable = null; // Set from server-side translation in agent_console.tpl
 
 // Shift filter variables (default: full day 00:00-23:59)
 var shiftFromHour = 0;
@@ -165,6 +178,7 @@ $(document).ready(function() {
     });
 
     $('#btn_hangup').button();
+    lblHangupDefault = $('#btn_hangup').button('option', 'label');
     $('#btn_hold').button();
     $('#btn_togglebreak').button();
     $('#btn_transfer').button();
@@ -333,6 +347,7 @@ function apply_form_styles()
 function initialize_client_state(nuevoEstado)
 {
 	estadoCliente.onhold = nuevoEstado.onhold;
+	estadoCliente.consultation = nuevoEstado.consultation || 'none';
 	estadoCliente.break_id = nuevoEstado.break_id;
 	estadoCliente.calltype = nuevoEstado.calltype;
 	estadoCliente.campaign_id = nuevoEstado.campaign_id;
@@ -767,6 +782,7 @@ function do_transfer()
         	// Attended transfer consultation started - disable Hold/Transfer buttons
         	$('#btn_hold').button('disable');
         	$('#btn_transfer').button('disable');
+        	arm_consultation_watchdog();
         }
 
         // El cambio de estado de la interfaz se delega a la revisión
@@ -775,6 +791,36 @@ function do_transfer()
 	.fail(function() {
 		mostrar_mensaje_error('Failed to connect to server to run request!');
 	});
+}
+
+/* Undo the speculative Hold/Transfer disable above when the console never
+ * learns that a consultation actually started.
+ *
+ * The dialer answers "consultation started" as soon as its AMI Redirect
+ * succeeds, before it knows whether the consultation took. It marks the
+ * consultation with an asynchronous message sent just before that Redirect, so
+ * when the colleague device fails instantly (unregistered peer, busy) the
+ * ConsultationEnd UserEvent can overtake that message, which is then discarded
+ * on purpose - and ConsultationStart is never emitted. estadoCliente
+ * .consultation therefore stays 'none', the server-side resync in
+ * manejarSesionActiva_checkStatus() sees client and server agreeing on 'none'
+ * and synthesizes no event, and the two buttons disabled just above would stay
+ * disabled until the page is reloaded.
+ *
+ * A consultation that really started moves estadoCliente.consultation to
+ * 'ringing' or 'answered' (either from the Consultation* event or from that
+ * same resync), which makes this watchdog a no-op. The call and hold guards
+ * mirror the ones the consultationend and holdenter handlers already use, so
+ * this never re-enables a button those handlers meant to keep disabled.
+ */
+function arm_consultation_watchdog()
+{
+	setTimeout(function() {
+		if (estadoCliente.consultation != 'none') return;
+		if (estadoCliente.callid == null || estadoCliente.onhold) return;
+		$('#btn_hold').button('enable');
+		$('#btn_transfer').button('enable');
+	}, 5000);
 }
 
 function do_confirm_contact()
@@ -952,6 +998,7 @@ function manejarRespuestaStatus(respuesta)
 				.removeClass('issabel-callcenter-class-estado-break')
 				.removeClass('issabel-callcenter-class-estado-activo')
 				.removeClass('issabel-callcenter-class-estado-esperando')
+				.removeClass('issabel-callcenter-class-estado-hold')
 				.addClass(respuesta[i].class_estado_agente_inicial);
 		if (respuesta[i].timer_seconds != null) {
 			if (respuesta[i].timer_seconds !== '') {
@@ -1086,6 +1133,19 @@ function manejarRespuestaStatus(respuesta)
 	        // Vaciar las áreas para la llamada
 			$('#issabel-callcenter-llamada-script').empty();
 			$('#issabel-callcenter-llamada-info').css("color", "#778899");
+
+	        // URLs marked with a "_hangup" opentype open here (the PHP backend
+	        // strips the suffix so the openers receive a plain iframe/window/
+	        // popup/jsonp). A null opentype is mapped to DELETE so any existing
+	        // startup tab/button for that slot is removed.
+	        if (!respuesta[i].urlopentype3) { respuesta[i].urlopentype3 = "DELETE"; }
+	        abrir_url_externo3(respuesta[i].urlopentype3, respuesta[i].url3, respuesta[i].urldescription3);
+
+	        if (!respuesta[i].urlopentype2) { respuesta[i].urlopentype2 = "DELETE"; }
+	        abrir_url_externo2(respuesta[i].urlopentype2, respuesta[i].url2, respuesta[i].urldescription2);
+
+	        if (!respuesta[i].urlopentype) { respuesta[i].urlopentype = "DELETE"; }
+	        abrir_url_externo(respuesta[i].urlopentype, respuesta[i].url, respuesta[i].urldescription);
 			break;
 		case 'waitingenter':
 			estadoCliente.waitingcall = true;
@@ -1094,9 +1154,30 @@ function manejarRespuestaStatus(respuesta)
 			estadoCliente.waitingcall = false;
 			break;
 		case 'consultationstart':
-			// Attended transfer consultation started - disable Hold/Transfer
+			// Attended transfer consultation started (colleague still
+			// ringing) - disable Hold/Transfer, and make clear that
+			// clicking Hangup now cancels the consultation.
+			estadoCliente.consultation = 'ringing';
 			$('#btn_hold').button('disable');
 			$('#btn_transfer').button('disable');
+			if (lblCancelTransfer) {
+				$('#btn_hangup').button('option', 'label', lblCancelTransfer);
+			}
+			$('#btn_hangup').removeClass('issabel-callcenter-boton-completar-transferencia')
+				.addClass('issabel-callcenter-boton-cancelar-transferencia');
+			break;
+		case 'consultationanswered':
+			// Colleague picked up - clicking Hangup now completes the
+			// transfer (bridges colleague+customer) instead of cancelling
+			// it. Make that visible on the button itself.
+			estadoCliente.consultation = 'answered';
+			$('#btn_hold').button('disable');
+			$('#btn_transfer').button('disable');
+			if (lblCompleteTransfer) {
+				$('#btn_hangup').button('option', 'label', lblCompleteTransfer);
+			}
+			$('#btn_hangup').removeClass('issabel-callcenter-boton-cancelar-transferencia')
+				.addClass('issabel-callcenter-boton-completar-transferencia');
 			break;
 		case 'consultationend':
 			// Consultation ended - re-enable all buttons only if the agent
@@ -1105,10 +1186,31 @@ function manejarRespuestaStatus(respuesta)
 			// during consultation (buttons should stay disabled).
 			// Use callid (not campaign_id) because incoming queue calls
 			// without a campaign have callid set but campaign_id == null.
+			estadoCliente.consultation = 'none';
+			$('#btn_hangup').button('option', 'label',
+				lblHangupDefault ? lblHangupDefault : $('#btn_hangup').text());
+			$('#btn_hangup').removeClass('issabel-callcenter-boton-cancelar-transferencia')
+				.removeClass('issabel-callcenter-boton-completar-transferencia');
 			if (estadoCliente.callid != null) {
 				$('#btn_hangup').button('enable');
 				$('#btn_hold').button('enable');
 				$('#btn_transfer').button('enable');
+			}
+			// If the consultation ended on its own (rather than the agent
+			// cancelling it, or completing it, or the customer hanging up),
+			// the dialer supplies the colleague Dial()'s DIALSTATUS - let the
+			// agent know why they are back with the customer.
+			switch (respuesta[i].reason) {
+			case 'BUSY':
+				if (msgTransferBusy) mostrar_mensaje_info(msgTransferBusy);
+				break;
+			case 'NOANSWER':
+				if (msgTransferNoAnswer) mostrar_mensaje_info(msgTransferNoAnswer);
+				break;
+			case 'CONGESTION':
+			case 'CHANUNAVAIL':
+				if (msgTransferUnavailable) mostrar_mensaje_info(msgTransferUnavailable);
+				break;
 			}
 			break;
 		}
@@ -1170,6 +1272,7 @@ function abrir_url_externo(urlopentype, url, title)
 				context:	document
 			});
 			break;
+		case 'popup':
 		case 'window':
             // Se quita la cejilla anterior. Se asume que se fue marcada con la clase .tab-externalurl
             $('#issabel-callcenter-cejillas-contenido').find('.ui-tabs-nav li.tab-externalurl').remove();
@@ -1189,6 +1292,11 @@ function abrir_url_externo(urlopentype, url, title)
                         window.open(url, '_blank');
                     }
                 });
+
+                // 'popup' opentype: auto-open on call connect (original v1 behavior).
+                if (urlopentype === 'popup') {
+                    window.open(url, '_blank');
+                }
             }
             break;
         default:
@@ -1232,6 +1340,7 @@ function abrir_url_externo2(urlopentype, url2, title)
                 context:    document
             });
             break;
+        case 'popup':
         case 'window':
         default:
             // Se quita la cejilla anterior. Se asume que se fue marcada con la clase .tab-externalurl
@@ -1253,6 +1362,10 @@ function abrir_url_externo2(urlopentype, url2, title)
                         window.open(url2, '_blank');
                     }
                 });
+
+                if (urlopentype === 'popup') {
+                    window.open(url2, '_blank');
+                }
             }
             break;
         }
@@ -1295,6 +1408,7 @@ function abrir_url_externo3(urlopentype, url3, title)
                 context:    document
             });
             break;
+        case 'popup':
         case 'window':
         default:
             // Se quita la cejilla anterior. Se asume que se fue marcada con la clase .tab-externalurl
@@ -1315,6 +1429,10 @@ function abrir_url_externo3(urlopentype, url3, title)
                         window.open(url3, '_blank');
                     }
                 });
+
+                if (urlopentype === 'popup') {
+                    window.open(url3, '_blank');
+                }
             }
             break;
         }

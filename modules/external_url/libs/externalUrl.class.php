@@ -80,10 +80,11 @@ class externalUrl
 
     function createURL($sUrlTemplate, $sDescription, $sOpenType)
     {
-    	if (!in_array($sOpenType, array('window', 'iframe', 'jsonp'))) {
+    	if (!in_array($sOpenType, array('window', 'popup', 'iframe', 'jsonp',
+            'window_hangup', 'popup_hangup', 'iframe_hangup', 'jsonp_hangup'))) {
             $this->errMsg = '(internal) Invalid URL open type';
     		return FALSE;
-    	}        
+    	}
         $sql = 'INSERT INTO campaign_external_url (urltemplate, description, opentype) VALUES (?, ?, ?)';
         $r = $this->_DB->genQuery($sql, array($sUrlTemplate, $sDescription, $sOpenType));
         if (!$r) {
@@ -96,10 +97,11 @@ class externalUrl
 
     function updateURL($id_url, $sUrlTemplate, $sDescription, $sOpenType)
     {
-        if (!in_array($sOpenType, array('window', 'iframe', 'jsonp'))) {
+        if (!in_array($sOpenType, array('window', 'popup', 'iframe', 'jsonp',
+            'window_hangup', 'popup_hangup', 'iframe_hangup', 'jsonp_hangup'))) {
             $this->errMsg = '(internal) Invalid URL open type';
             return FALSE;
-        }        
+        }
         $sql = 'UPDATE campaign_external_url SET urltemplate = ?, description = ?, opentype = ? WHERE id = ?';
         $r = $this->_DB->genQuery($sql, array($sUrlTemplate, $sDescription, $sOpenType, $id_url));
         if (!$r) {

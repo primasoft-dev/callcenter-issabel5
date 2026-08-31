@@ -47,7 +47,55 @@ Arquitectura
 Comunicaciones TCP/IP
 ---------------------
 
-La comunicación será TCP en el puerto 20005.
+La comunicación será TCP en el puerto 20005, siempre cifrada con TLS 1.3
+(suite negociada: TLS_AES_256_GCM_SHA384). El servidor no acepta conexiones en
+texto claro: un cliente que abra el puerto sin negociar TLS es descartado.
+
+El certificado del servidor lo instala /opt/issabel/dialer/eccp-cert.sh en
+/etc/issabel/dialer/eccp.pem (clave en eccp.key), legible por el usuario
+asterisk. Por omisión es un certificado autofirmado ECDSA P-256 generado en la
+instalación y no una copia del de Apache, por tres motivos: que la huella fijada
+por los clientes no cambie al renovarse el certificado web, que ECDSA firme el
+saludo mucho más rápido que RSA-2048, y para separar la identidad de ECCP de la
+del web y la de SIP/WSS. (No se trata de ocultar la clave web al usuario
+asterisk: Issabel ya la entrega en /etc/asterisk/keys/asterisk.pem, propiedad de
+asterisk.) Con ECCP_CERT_MODE=generate-san se añaden SAN, y con
+ECCP_CERT_MODE=copy se reutiliza el certificado de Apache, lo que tiene sentido
+cuando éste procede de una CA real. Tras una renovación, eccp-cert.sh renew
+actualiza la copia y reinicia el dialer.
+
+Por omisión el cliente NO verifica el certificado del servidor: sólo se cifra.
+Esto es deliberado, ya que permite alcanzar al dialer por localhost, por nombre
+de máquina o por IP cruda, sin depender de DNS local, y sin que un cambio de IP
+o el vencimiento del certificado rompan la conectividad. Protege contra la
+captura pasiva de la clave de login y de los datos de llamadas; no autentica al
+servidor.
+
+Quien necesite además protección contra un atacante activo (hombre en el medio)
+puede fijar el certificado del servidor por su huella SHA-256. Se compara la
+huella, no la cadena ni el nombre, así que fijarlo no cuesta conectividad:
+localhost, nombre e IP cruda siguen funcionando igual. eccp-cert.sh imprime la
+huella al instalar.
+
+    $e = new ECCP();
+    $e->setCaFile('/etc/issabel/dialer/eccp.pem');   // copia del certificado
+    $e->setPeerFingerprint('7B:79:E1:...:9B:F4');    // o sólo la huella
+    $e->connect('192.168.1.10', 'usuario', 'clave');
+
+También puede activarse globalmente definiendo la constante ECCP_CA_FILE o
+ECCP_PEER_FINGERPRINT.
+
+Para depurar la conexión ya no sirve telnet; en su lugar:
+
+    openssl s_client -connect localhost:20005
+
+Ejemplo de cliente en PHP (sólo cifrado):
+
+    $ctx = stream_context_create(array('ssl' => array(
+        'verify_peer' => FALSE, 'verify_peer_name' => FALSE,
+        'allow_self_signed' => TRUE)));
+    $h = stream_socket_client('tls://localhost:20005', $errno, $errstr,
+        30, STREAM_CLIENT_CONNECT, $ctx);
 
 Sesiones
 --------
