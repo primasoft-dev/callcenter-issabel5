@@ -46,6 +46,9 @@ class AMIEventProcess extends TuberiaProcess
     private $_listaLlamadas;
     private $_agentesEnAtxferComplete = array(); // Agents completing attended transfer (suppress Agentlogoff)
     private $_agentesEnConsultation = array();   // Agents in attended transfer consultation (callback type)
+    private $_agentesConsultaContestada = array(); // Agent/NNNN => array('channel' => colleague's real channel, 'timestamp' => ...), set once the consult leg answers
+    private $_ultimaConsultaFallida = array();   // Agent/NNNN => DIALSTATUS of the last consultation that failed (BUSY/NOANSWER/...)
+    private $_consultaTerminadaEn = array();     // Agent/NNNN => microtime of the last ConsultationEnd, to reject a late "consultation started" mark
     private $_agentesEnTransferPendiente = array(); // Agents with pending blind transfer (prevent double transfer)
 
     // Estimación de la versión de Asterisk que se usa
@@ -138,6 +141,7 @@ class AMIEventProcess extends TuberiaProcess
             'iniciarBreakAgente', 'iniciarHoldAgente',
             'esAgenteEnAtxferComplete',
             'esAgenteEnConsultation',
+            'infoConsultaContestada',
             'reservarAgenteParaTransferencia') as $k)
             $this->_tuberia->registrarManejador('*', $k, array($this, "rpc_$k"));
 
@@ -375,6 +379,38 @@ class AMIEventProcess extends TuberiaProcess
         }
     }
 
+    /**
+     * Current attended-transfer consultation state for an agent, as a single
+     * value the agent console can reconcile against on every status poll:
+     * 'none', 'ringing' (colleague being called) or 'answered' (colleague
+     * picked up, so the transfer can now be completed).
+     *
+     * The ConsultationStart/Answered/End events are only delivered to ECCP
+     * clients that happen to be connected at that instant, so a console whose
+     * long poll is between requests can miss one and be left showing a stale
+     * "Cancel transfer" button until the page is reloaded. Reporting the state
+     * here lets the console self-heal, the same way it already reconciles the
+     * break and hold states it can miss events for.
+     */
+    private function _estadoConsultaAgente($sAgente, $a)
+    {
+        /* Una consulta no puede sobrevivir a la llamada desde la que se
+         * inició, así que si el agente ya no tiene llamada activa cualquier
+         * bandera que quede es obsoleta y se reporta 'none'. Se conserva como
+         * red de seguridad: si alguna vía de limpieza fallara, sin esta
+         * comprobación la consola quedaría resincronizando a "ringing"
+         * indefinidamente y el botón se atascaría incluso al recargar. */
+        /* EN: A consultation cannot outlive the call it was started from, so if
+         * the agent no longer has an active call any leftover flag is stale and
+         * 'none' is reported. Kept as a safety net: should any cleanup path
+         * ever fail, without this check the console would keep resyncing to
+         * "ringing" forever and the button would stick even across reloads. */
+        if (is_null($a) || is_null($a->llamada)) return 'none';
+        if (isset($this->_agentesConsultaContestada[$sAgente])) return 'answered';
+        if (isset($this->_agentesEnConsultation[$sAgente])) return 'ringing';
+        return 'none';
+    }
+
     private function _infoSeguimientoAgente($sAgente)
     {
         if (is_array($sAgente)) {
@@ -382,11 +418,17 @@ class AMIEventProcess extends TuberiaProcess
             foreach ($sAgente as $s) {
                 $a = $this->_listaAgentes->buscar('agentchannel', $s);
                 $is[$s] = (is_null($a)) ? NULL : $a->resumenSeguimiento();
+                if (!is_null($is[$s])) $is[$s]['consultation'] = $this->_estadoConsultaAgente($s, $a);
             }
             return $is;
         } else {
             $a = $this->_listaAgentes->buscar('agentchannel', $sAgente);
-            return (is_null($a)) ? NULL : $a->resumenSeguimiento();
+            if (is_null($a)) return NULL;
+            $info = $a->resumenSeguimiento();
+            $info['consultation'] = $this->_estadoConsultaAgente($sAgente, $a);
+            $info['consultation_reason'] = isset($this->_ultimaConsultaFallida[$sAgente])
+                ? $this->_ultimaConsultaFallida[$sAgente] : '';
+            return $info;
         }
     }
 
@@ -1193,6 +1235,25 @@ class AMIEventProcess extends TuberiaProcess
         $fElapsed = ($fAfterFinalize - $fBeforeFinalize) * 1000;
         $this->_log->output("TIMING: ".__METHOD__.": [AFTER_TRANSFER_RELEASE] Agent=$sAgente, elapsed_ms=".round($fElapsed,3).", agent_call_null=".(is_null($a->llamada)?'YES':'NO').", microtime=$fAfterFinalize | ES: Después de liberar agente para transferencia");
 
+        // Defensive cleanup: when this is reached via the web-console
+        // "Complete Transfer" path (Agent-type attended transfer completing
+        // via a dual Redirect rather than a real hangup), the dialplan's own
+        // end-of-consultation UserEvent(ConsultationEnd,...) never runs -
+        // clear any leftover consultation-tracking state here so the map
+        // doesn't leak and the front-end's Hold/Transfer buttons re-enable.
+        // No-op for blind-transfer/transfer-to-agent callers, which never
+        // set these maps.
+        if (isset($this->_agentesEnConsultation[$sAgente])
+                || isset($this->_agentesEnAtxferComplete[$sAgente])
+                || isset($this->_agentesConsultaContestada[$sAgente])) {
+            unset($this->_agentesEnConsultation[$sAgente]);
+            unset($this->_agentesEnAtxferComplete[$sAgente]);
+            unset($this->_agentesConsultaContestada[$sAgente]);
+            $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
+                array('ConsultationEnd', array($sAgente))
+            ));
+        }
+
         // Clear transfer reservation if source agent had one pending
         // Limpiar reserva de transferencia si el agente origen tenía una pendiente
         foreach ($this->_agentesEnTransferPendiente as $sTarget => $info) {
@@ -1577,9 +1638,26 @@ class AMIEventProcess extends TuberiaProcess
 
         // Se arma mapa de miembros tal como aparecen en database --> channel
         // Build map of members as they appear in database --> channel
+        /* La letra de prefijo debe coincidir con la convencion propia de
+         * issabelPBX en admin/modules/queues/agi-bin/queue_devstate.agi
+         * ($member_prefix): A=AGENT, S=SIP, P=PJSIP, X=IAX2, Z=ZAP, D=DAHDI.
+         * Tomar $type[0] es incorrecto para IAX2: da 'I' en vez de 'X', asi
+         * que el agente nunca coincide con la clave que escribe issabelPBX. */
+        /* The prefix letter must match issabelPBX's own convention in
+         * admin/modules/queues/agi-bin/queue_devstate.agi ($member_prefix):
+         * A=AGENT, S=SIP, P=PJSIP, X=IAX2, Z=ZAP, D=DAHDI.
+         * Taking $type[0] is wrong for IAX2: it yields 'I' instead of 'X', so
+         * the agent never matches the key issabelPBX actually writes. */
+        $prefijoTecnologia = array(
+            'AGENT' => 'A', 'SIP' => 'S', 'PJSIP' => 'P',
+            'IAX2'  => 'X', 'ZAP' => 'Z', 'DAHDI' => 'D',
+        );
         $arrExt = array();
         foreach ($total_agents as $tupla) {
-            $extension = $tupla['type'][0] . $tupla['number'];
+            $sTipo = strtoupper($tupla['type']);
+            $sPrefijo = isset($prefijoTecnologia[$sTipo])
+                ? $prefijoTecnologia[$sTipo] : substr($tupla['type'], 0, 1);
+            $extension = $sPrefijo . $tupla['number'];
             $arrExt[$extension] = $tupla['type'].'/'.$tupla['number'];
         }
 
@@ -1800,15 +1878,75 @@ class AMIEventProcess extends TuberiaProcess
             isset($this->_agentesEnConsultation[$sAgente]));
     }
 
+    // Returns array('channel' => ..., 'timestamp' => ...) if the colleague
+    // in this agent's attended-transfer consultation has answered, NULL otherwise.
+    public function rpc_infoConsultaContestada($sFuente, $sDestino,
+        $sNombreMensaje, $iTimestamp, $datos)
+    {
+        list($sAgente) = $datos;
+        $this->_tuberia->enviarRespuesta($sFuente,
+            isset($this->_agentesConsultaContestada[$sAgente])
+                ? $this->_agentesConsultaContestada[$sAgente] : NULL);
+    }
+
     public function msg_marcarConsultationIniciada($sFuente, $sDestino,
         $sNombreMensaje, $iTimestamp, $datos)
     {
         call_user_func_array(array($this, '_marcarConsultationIniciada'), $datos);
     }
 
-    private function _marcarConsultationIniciada($sAgente)
+    private function _marcarConsultationIniciada($sAgente, $fSolicitud = NULL)
     {
+        /* Este mensaje es asíncrono y se envía justo antes del Redirect que
+         * arranca el Dial() al colega. Si el colega está ocupado o rechaza al
+         * instante, el UserEvent ConsultationEnd puede haberse procesado ya
+         * cuando este mensaje llega. Poner la bandera ahora resucitaría una
+         * consulta que ya terminó y dejaría el botón de la consola atascado
+         * en "Cancelar transferencia" hasta que acabe la llamada. */
+        /* EN: This message is async and is sent just before the Redirect that
+         * starts the Dial() to the colleague. If the colleague is busy or
+         * declines instantly, the ConsultationEnd UserEvent may already have
+         * been processed by the time this arrives. Setting the flag now would
+         * resurrect a consultation that already ended and wedge the console's
+         * button on "Cancel transfer" until the call finishes. */
+        if (!is_null($fSolicitud) && isset($this->_consultaTerminadaEn[$sAgente])
+                && $this->_consultaTerminadaEn[$sAgente] > $fSolicitud) {
+            $this->_log->output('INFO: '.__METHOD__.' - ignoring late consultation mark for '.
+                $sAgente.': its ConsultationEnd was already processed'.
+                ' (end='.$this->_consultaTerminadaEn[$sAgente].' request='.$fSolicitud.')'.
+                ' | ES: se ignora marca tardía de consulta para '.$sAgente.
+                ': su ConsultationEnd ya fue procesado');
+            /* La consola ya deshabilitó Hold/Transferir al recibir la respuesta
+             * de atxfercall, que se envía antes de saber si la consulta llegó a
+             * existir. Como aquí no se va a emitir ConsultationStart, se
+             * reemite ConsultationEnd con el motivo guardado: el
+             * ConsultationEnd original se emitió mientras el navegador todavía
+             * estaba esperando esa respuesta, así que suele perderse, y la
+             * resincronización por estado no puede entregarlo porque cliente y
+             * servidor coinciden en 'none'. Reemitir es inocuo si el primero
+             * sí llegó: el aviso es un único banner que se reescribe. */
+            /* EN: The console already disabled Hold/Transfer when it got the
+             * atxfercall reply, which is sent before it is known whether the
+             * consultation ever existed. Since ConsultationStart will not be
+             * emitted here, re-emit ConsultationEnd with the stored reason: the
+             * original one was emitted while the browser was still waiting for
+             * that reply, so it is usually lost, and the state resync cannot
+             * deliver it because client and server agree on 'none'. Re-emitting
+             * is harmless if the first one did arrive: the notice is a single
+             * banner whose text is simply rewritten. */
+            $sDialStatus = isset($this->_ultimaConsultaFallida[$sAgente])
+                ? $this->_ultimaConsultaFallida[$sAgente] : '';
+            $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
+                array('ConsultationEnd', array($sAgente, $sDialStatus))
+            ));
+            return;
+        }
+        unset($this->_consultaTerminadaEn[$sAgente]);
+
         $this->_log->output('DEBUG: '.__METHOD__.' - Marking consultation started for '.$sAgente);
+        // A new attempt starts: forget why the previous one failed, so a stale
+        // reason can never be reported against this consultation.
+        unset($this->_ultimaConsultaFallida[$sAgente]);
         $this->_agentesEnConsultation[$sAgente] = time();
         // Emit event to front-end to disable Hold/Transfer buttons
         $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
@@ -1977,19 +2115,111 @@ class AMIEventProcess extends TuberiaProcess
     {
         if (!isset($params['UserEvent'])) return FALSE;
 
+        if ($params['UserEvent'] == 'ConsultationAnswered' && isset($params['Agent'])) {
+            $sAgente = trim($params['Agent']);
+            $sColleagueChannel = isset($params['Channel']) ? trim($params['Channel']) : NULL;
+            $this->_log->output('DEBUG: '.__METHOD__.": ConsultationAnswered UserEvent received for agent=$sAgente colleague_channel=$sColleagueChannel");
+            $this->_agentesConsultaContestada[$sAgente] = array(
+                'channel'   => $sColleagueChannel,
+                'timestamp' => time(),
+            );
+            // Let the front-end know it can now offer to complete the transfer
+            $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
+                array('ConsultationAnswered', array($sAgente))
+            ));
+        }
+
         if ($params['UserEvent'] == 'ConsultationEnd' && isset($params['Agent'])) {
             $sAgente = trim($params['Agent']);
             $this->_log->output("DEBUG_HOLD: [" . date('Y-m-d H:i:s.') . substr(microtime(), 2, 3) .
                 "] ConsultationEnd UserEvent received for agent=$sAgente" .
-                " was_in_consultation=" . (isset($this->_agentesEnConsultation[$sAgente]) ? 'YES' : 'NO'));
-            if (isset($this->_agentesEnConsultation[$sAgente])) {
-                unset($this->_agentesEnConsultation[$sAgente]);
-                $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
-                    array('ConsultationEnd', array($sAgente))
-                ));
+                " was_in_consultation=" . (isset($this->_agentesEnConsultation[$sAgente]) ? 'YES' : 'NO') .
+                " was_in_atxfercomplete=" . (isset($this->_agentesEnAtxferComplete[$sAgente]) ? 'YES' : 'NO'));
+            /* Este UserEvent sólo lo emiten los contextos de consulta de este
+             * módulo, así que siempre corresponde a una consulta que este
+             * proceso inició: se actúa incondicionalmente. La bandera
+             * _agentesEnConsultation la pone un mensaje asíncrono
+             * (marcarConsultationIniciada) enviado justo antes del Redirect
+             * AMI, de modo que si el colega está ocupado o rechaza al
+             * instante este evento puede llegar ANTES que ese mensaje. Si se
+             * condicionara la limpieza a que la bandera ya estuviera puesta,
+             * en esa carrera se perderían el motivo y el evento, y la bandera
+             * que llega después no la limpiaría nadie: el botón "Cancelar
+             * transferencia" se quedaría atascado hasta recargar la página.
+             * La marca de tiempo de abajo cierra la otra mitad de la carrera
+             * haciendo que el mensaje tardío se descarte. */
+            /* EN: This UserEvent is only emitted by this module's own
+             * consultation contexts, so it always refers to a consultation
+             * this process started - act unconditionally. The
+             * _agentesEnConsultation flag is set by an async message
+             * (marcarConsultationIniciada) sent just before the AMI Redirect,
+             * so when the colleague is busy or declines instantly this event
+             * can arrive BEFORE that message. Gating the cleanup on the flag
+             * already being set would lose both the reason and the event in
+             * that race, and nothing would ever clear the flag that lands
+             * afterwards: the console's "Cancel transfer" cue would stick
+             * until the page is reloaded. The timestamp below closes the
+             * other half of the race by making the late message a no-op. */
+            $this->_consultaTerminadaEn[$sAgente] = microtime(TRUE);
+
+            unset($this->_agentesEnConsultation[$sAgente]);
+            unset($this->_agentesConsultaContestada[$sAgente]);
+            // The consultation ended on its own (colleague busy/no-answer/
+            // declined/hung-up-first) rather than via an explicit agent
+            // completion - clear any transfer stamped at consult-start so
+            // the agent's next (now perfectly normal) hangup isn't
+            // misdetected as "transfer completed".
+            $a = $this->_listaAgentes->buscar('agentchannel', $sAgente);
+            if (!is_null($a)) $this->_limpiarTransferPendiente($a->llamada);
+            // DIALSTATUS from the consult Dial(), if this UserEvent came
+            // from the natural end of [atxfer-consult]/[cbxfer-consult]
+            // (busy/no-answer/declined/colleague-hung-up-first) - lets the
+            // console show the agent why the consultation ended. Empty for
+            // any other path that fires ConsultationEnd (explicit cancel,
+            // customer hangup, agent channel hangup, transfer completion),
+            // none of which set this UserEvent header.
+            $sDialStatus = isset($params['Status']) ? trim($params['Status']) : '';
+            /* Recordar por qué falló la consulta. El evento que se emite
+             * abajo sólo llega a los clientes ECCP conectados en ese
+             * instante, y justo aquí suele haber una ráfaga de eventos que
+             * hace que el long-poll de la consola se esté reconectando, así
+             * que con frecuencia se pierde (el caso típico: colega
+             * ocupado). Guardando el motivo, la resincronización por
+             * estado de _infoSeguimientoAgente() puede entregarlo igual y
+             * el aviso aparece siempre. */
+            /* EN: Remember why the consultation failed. The event emitted
+             * below only reaches ECCP clients connected at that instant,
+             * and this moment usually carries a burst of events that leaves
+             * the console long poll reconnecting, so it is frequently lost
+             * (typical case: busy colleague). Storing the reason lets the
+             * state resync in _infoSeguimientoAgente() deliver it anyway,
+             * so the notice always appears. */
+            if (in_array($sDialStatus, array('BUSY', 'NOANSWER', 'CONGESTION', 'CHANUNAVAIL'))) {
+                $this->_ultimaConsultaFallida[$sAgente] = $sDialStatus;
             }
+            $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
+                array('ConsultationEnd', array($sAgente, $sDialStatus))
+            ));
         }
         return FALSE;
+    }
+
+    /**
+     * Clear a call's stale `transfer` DB column after an attended-transfer
+     * consultation ends without an explicit completion (colleague busy/
+     * no-answer/declined/hung-up-first). Without this, `transfer` stays
+     * stamped with the colleague's extension from the moment the
+     * consultation started, causing the agent's next (unrelated) hangup to
+     * be misdetected as "transfer completed".
+     */
+    private function _limpiarTransferPendiente($llamada)
+    {
+        if (is_null($llamada) || is_null($llamada->id_llamada)) return;
+        $this->_tuberia->msg_SQLWorkerProcess_sqlupdatecalls(array(
+            'tipo_llamada' => $llamada->tipo_llamada,
+            'id'           => $llamada->id_llamada,
+            'transfer'     => '',
+        ));
     }
 
     public function msg_abortarNuevasLlamadasMarcar($sFuente, $sDestino,
@@ -3042,6 +3272,48 @@ Uniqueid: 1429642067.241008
                 $this->_log->output('DEBUG: '.__METHOD__.': ignoro hangup local | EN: ignoring local hangup');
                 return FALSE;
             }
+
+            /* Asterisk saca el par de canales Local del puente en cuanto ambos
+             * lados quedan enlazados ("bridge.c: Move-swap optimizing
+             * Local/<num>@from-internal-XXXXXXXX;1 <-- SIP/<troncal>-YYYYYYYY").
+             * Las dos patas cuelgan entonces con Cause 16 mientras el canal real
+             * del troncal sigue conversando con el agente. En una llamada de
+             * campaña saliente marcada por plan de marcado la pata ;1 lleva el
+             * Uniqueid de la llamada misma, así que la comprobación de arriba la
+             * reconoce y la llamada se daría por terminada estando todavía en
+             * curso. Si la llamada está enlazada a un agente, no está en medio de
+             * una transferencia, y tiene un canal real (no Local) distinto del que
+             * cuelga, esto es la optimización y no el fin de la llamada: se ignora.
+             * El Hangup del canal real la finaliza después, encontrado por el
+             * índice actualchannel más abajo. */
+            /* EN: Asterisk optimizes the Local channel pair out of the bridge as
+             * soon as both sides are linked ("bridge.c: Move-swap optimizing
+             * Local/<num>@from-internal-XXXXXXXX;1 <-- SIP/<trunk>-YYYYYYYY").
+             * Both halves then hang up with Cause 16 while the real trunk channel
+             * keeps talking to the agent. On an outgoing campaign call dialed
+             * through the dialplan the ;1 half carries the call's own Uniqueid, so
+             * the check above matches it and the call would be finalized while it
+             * is still up. If the call is linked to an agent, is not in the middle
+             * of a transfer, and has a real (non-Local) channel other than the one
+             * hanging up, this is the optimization and not the end of the call:
+             * ignore it. The real channel's own Hangup finalizes the call later,
+             * matched by the actualchannel index below. */
+            $llamadaLocal = $this->_listaLlamadas->buscar('uniqueid', $params['Uniqueid']);
+            if (!is_null($llamadaLocal)
+                    && !$llamadaLocal->transfer_pending
+                    && !is_null($llamadaLocal->agente)
+                    && !is_null($llamadaLocal->timestamp_link)
+                    && !is_null($llamadaLocal->actualchannel)
+                    && strpos($llamadaLocal->actualchannel, 'Local/') !== 0
+                    && $llamadaLocal->actualchannel != $params['Channel']) {
+                $this->_log->output('DEBUG: '.__METHOD__.
+                    ': Local channel optimized out of the bridge, call continues on '.
+                    $llamadaLocal->actualchannel.', ignoring hangup'.
+                    ' | uniqueid='.$params['Uniqueid'].' channel='.$params['Channel'].
+                    ' | ES: canal Local optimizado fuera del puente, la llamada sigue en '.
+                    $llamadaLocal->actualchannel.', se ignora el hangup');
+                return FALSE;
+            }
             $this->_log->output('DEBUG: '.__METHOD__.
                 ': Local channel hangup matches tracked call, processing normally'.
                 ' | uniqueid='.$params['Uniqueid'].' channel='.$params['Channel']);
@@ -3068,6 +3340,20 @@ Uniqueid: 1429642067.241008
         // uniqueid than the call's tracked uniqueid. Search by actualchannel as fallback.
         if (is_null($llamada)) {
             $llamada = $this->_listaLlamadas->buscar('actualchannel', $params['Channel']);
+        }
+
+        // The agent's own login_channel just hung up for real while an
+        // attended-transfer consultation was in progress for them (whether
+        // still ringing, mid-conversation with the colleague, or completing
+        // via the classic "hang up your phone" path). $a resolved above via
+        // uniqueidlink is this agent - handle this before the generic
+        // dispatch below, which would otherwise finalize the call while the
+        // held customer channel is still alive in atxfer-hold's MOH loop.
+        if (!is_null($a) && (isset($this->_agentesEnConsultation[$a->channel])
+                || isset($this->_agentesEnAtxferComplete[$a->channel]))) {
+            $this->_manejarHangupLoginChannelEnConsulta($a, $llamada, $params);
+            if ($this->_finalizandoPrograma) $this->_verificarFinalizacionLlamadas();
+            return FALSE;
         }
 
         if (!is_null($llamada)) {
@@ -3156,7 +3442,39 @@ Uniqueid: 1429642067.241008
                 $this->_config['dialer']['llamada_corta']);
         } else {
             if ($llamada->status == 'OnHold') {
-                if ($this->DEBUG) {
+                /* Un Hangup del canal del cliente estacionado mientras la llamada
+                 * está OnHold significa que el cliente colgó realmente, aunque no
+                 * haya llegado el evento ParkedCallGiveUp (p.ej. el retorno por
+                 * timeout del parking marcó un destino inválido y Asterisk colgó
+                 * el canal estacionado directamente, o el troncal envió BYE / cayó
+                 * la red). Se finaliza la llamada igual que en msg_ParkedCallGiveUp;
+                 * de lo contrario el registro queda atascado en current_call_entry /
+                 * call_entry para siempre. Los Hangup de otros canales durante HOLD
+                 * (pata del agente, canal auxiliar de park-dial fallido) se siguen
+                 * ignorando. */
+                /* A Hangup for the parked caller's own channel while the call is
+                 * OnHold means the caller genuinely disconnected even though no
+                 * ParkedCallGiveUp event arrived (e.g. the park timeout return
+                 * dialed an invalid target and Asterisk hung up the parked channel
+                 * directly, or the trunk sent BYE / the network dropped). Finalize
+                 * the call as msg_ParkedCallGiveUp() does; otherwise the record
+                 * stays stuck in current_call_entry / call_entry forever. Hangups
+                 * for other channels during HOLD (agent leg, failed park-dial
+                 * auxiliary channel) are still ignored. */
+                if ($params['Channel'] == $llamada->actualchannel && !$llamada->atxfer_hold) {
+                    $this->_log->output('INFO: '.__METHOD__.': cliente colgó mientras '.
+                        'estaba en HOLD sin ParkedCallGiveUp, finalizando llamada | '.
+                        'EN: caller hung up while OnHold with no ParkedCallGiveUp, '.
+                        'finalizing call. channel='.$params['Channel'].
+                        ' uniqueid='.$params['Uniqueid'].' call_uid='.$llamada->uniqueid);
+                    /* Limpiar estado de hold (cierra el registro de auditoría de
+                     * hold) y luego finalizar el seguimiento. | EN: clear hold state
+                     * (closes the hold audit record) then finalize tracking. */
+                    $llamada->llamadaRegresaHold($this->_ami, $params['local_timestamp_received']);
+                    $llamada->llamadaFinalizaSeguimiento(
+                        $params['local_timestamp_received'],
+                        $this->_config['dialer']['llamada_corta']);
+                } else if ($this->DEBUG) {
                     $this->_log->output('DEBUG: '.__METHOD__.': se ignora Hangup para llamada que se envía a HOLD. | EN: ignoring Hangup for call that is being sent to HOLD.');
                 }
             } else {
@@ -3175,10 +3493,102 @@ Uniqueid: 1429642067.241008
     }
 
     /**
+     * The agent's own channel just hung up for real while they were in an
+     * attended-transfer consultation. For Agent type (app_agent_pool) that
+     * is the login_channel; for callback type it is the device channel that
+     * was Redirected into [cbxfer-consult]. This covers a genuine device
+     * failure/disconnect, the classic "hang up your phone to complete the
+     * transfer" mechanic, and the console's Complete Transfer button (which
+     * redirects the agent's channel into [cbxfer-done] to hang up) - the
+     * agent's own channel is truly gone in every case, so there is no
+     * dialplan location left to run cleanup on it.
+     *
+     * If the colleague never answered, the held customer has nobody left to
+     * talk to - hang them up and finalize the call normally. If the
+     * colleague had already answered, they have been redirected into
+     * atxfer-bridge and are (or are about to be) live with the customer, so
+     * the customer must be left alone and the agent released without
+     * finalizing: the call isn't marked "finished" while that conversation
+     * is still happening, and finalizes normally once its real hangup
+     * eventually arrives.
+     */
+    private function _manejarHangupLoginChannelEnConsulta($a, $llamada, $params)
+    {
+        $sAgente = $a->channel;
+        $bAnswered = isset($this->_agentesConsultaContestada[$sAgente]);
+        $this->_log->output('INFO: '.__METHOD__.": Agent $sAgente channel hung up during attended-transfer ".
+            "consultation (answered=".($bAnswered ? 'yes' : 'no').") | EN/ES: agente $sAgente colgó su canal ".
+            "durante consulta de transferencia atendida (contestada=".($bAnswered ? 'si' : 'no').")");
+
+        // Clear consultation-tracking state up front, before any nested
+        // processing (e.g. _procesarLlamadaColgada() below internally calls
+        // _terminarConsultaSiClienteCuelga(), which only acts while these
+        // are still set) - avoids a doomed Redirect attempt on this
+        // already-dead channel and a duplicate ConsultationEnd emission.
+        unset($this->_agentesEnConsultation[$sAgente]);
+        unset($this->_agentesEnAtxferComplete[$sAgente]);
+        unset($this->_agentesConsultaContestada[$sAgente]);
+
+        if ($bAnswered) {
+            /* El colega ya contestó: F() (o el Redirect doble de "Completar
+             * transferencia") lo ha llevado a atxfer-bridge, donde queda
+             * hablando con el cliente retenido. Colgar el canal del cliente
+             * aquí destruiría precisamente la transferencia que se acaba de
+             * completar, así que se deja vivo y sólo se libera al agente. La
+             * llamada se finaliza sola, con su duración real, cuando esa
+             * conversación termine de verdad. */
+            /* EN: The colleague already answered: F() (or the "Complete
+             * transfer" dual Redirect) has moved them into atxfer-bridge,
+             * where they end up talking to the held customer. Hanging the
+             * customer's channel up here would destroy the very transfer that
+             * just completed, so leave it alive and only release the agent.
+             * The call finalizes on its own, with its real duration, once
+             * that conversation actually ends. */
+            if (!is_null($llamada)) $llamada->llamadaTransferidaDesdeAgente($params['local_timestamp_received']);
+        } else {
+            // Colleague was still ringing - the customer is stuck in
+            // atxfer-hold's MusicOnHold with nobody left to talk to.
+            if (!is_null($llamada) && !empty($llamada->actualchannel)) {
+                $this->_ami->Hangup($llamada->actualchannel);
+            }
+            if (!is_null($llamada)) $this->_procesarLlamadaColgada($llamada, $params);
+        }
+
+        $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
+            array('ConsultationEnd', array($sAgente))
+        ));
+
+        /* Sólo para logins con canal de login (tipo Agent): ese canal está
+         * muerto y no va a volver a entrar en AgentLogin, así que hay que
+         * registrar el logoff real. Un agente callback NO tiene canal de
+         * login: el canal que acaba de colgar era simplemente el de esta
+         * llamada, y sigue conectado en la consola esperando la siguiente.
+         * Desloguearlo aquí lo echaría de la consola sin motivo. */
+        /* EN: Only for login-channel logins (Agent type): that channel is
+         * dead and will never re-enter AgentLogin, so real logoff bookkeeping
+         * has to run. A callback agent has NO login channel - the channel
+         * that just hung up was merely this call's, and they are still
+         * connected in the console waiting for the next one. Logging them off
+         * here would kick them out of the console for no reason. */
+        if (!empty($a->login_channel)) {
+            $this->_ejecutarLogoffAgente($sAgente, $a, $params['local_timestamp_received'],
+                'login_channel hangup during atxfer-consult');
+        } else {
+            $this->_log->output('DEBUG: '.__METHOD__.": $sAgente has no login_channel ".
+                "(callback type) - console session preserved | ES: $sAgente no tiene canal de ".
+                "login (tipo callback) - se conserva su sesión de consola");
+        }
+    }
+
+    /**
      * When the customer hangs up during an attended transfer consultation,
-     * redirect the agent to atxfer-complete to terminate the consultation call
-     * and re-enter AgentLogin. Without this, the agent is left in atxfer-consult
-     * dialplan with disabled buttons and no way to end the consulting call.
+     * terminate the consultation call so the agent is not left in the consult
+     * dialplan with disabled buttons and no way to end it.
+     *
+     * Agent type (app_agent_pool) is redirected to atxfer-complete, which ends
+     * the consultation and re-enters AgentLogin. A callback agent has no
+     * AgentLogin session to return to, so its channel is redirected to
+     * cbxfer-done, which simply hangs it up.
      */
     private function _terminarConsultaSiClienteCuelga($llamada)
     {
@@ -3187,35 +3597,56 @@ Uniqueid: 1429642067.241008
         $sAgente = $llamada->agente->channel;
         if (!isset($this->_agentesEnConsultation[$sAgente])) return;
 
-        // Only handle Agent type (app_agent_pool) - callback agents use
-        // native Atxfer which handles this differently
-        if ($llamada->agente->type != 'Agent') return;
+        $bTipoAgent = ($llamada->agente->type == 'Agent');
 
-        $loginChannel = $llamada->agente->login_channel;
-        if (empty($loginChannel)) {
-            $this->_log->output('WARN: '.__METHOD__.': Agent '.$sAgente.
-                ' is in consultation but has no login_channel, cannot redirect'.
-                ' | EN: Agent '.$sAgente.' is in consultation but has no login_channel, cannot redirect');
-            return;
+        if ($bTipoAgent) {
+            $sCanalAgente = $llamada->agente->login_channel;
+            $sExten       = $llamada->agente->number;
+            $sContexto    = 'atxfer-complete';
+            if (empty($sCanalAgente)) {
+                $this->_log->output('WARN: '.__METHOD__.': Agent '.$sAgente.
+                    ' is in consultation but has no login_channel, cannot redirect'.
+                    ' | EN: Agent '.$sAgente.' is in consultation but has no login_channel, cannot redirect');
+                return;
+            }
+            // Set the atxfer completion flag to suppress Agentlogoff
+            $this->_prepararAtxferComplete($sAgente);
+        } else {
+            /* Agente callback: el canal a sacar de la consulta es el de esta
+             * llamada. Debe ser el canal real con identificador único; el
+             * accesor cae a _agentchannel (p.ej. "SIP/1002" a secas), que
+             * Asterisk no puede redirigir. */
+            /* EN: Callback agent: the channel to pull out of the consultation
+             * is this call's own. It must be the real channel with its unique
+             * id; the accessor falls back to _agentchannel (a bare
+             * "SIP/1002"), which Asterisk cannot redirect. */
+            $sCanalAgente = $llamada->actualAgentChannel;
+            $sExten       = 's';
+            $sContexto    = 'cbxfer-done';
+            if (empty($sCanalAgente) || strpos($sCanalAgente, '-') === FALSE) {
+                $this->_log->output('WARN: '.__METHOD__.': callback agent '.$sAgente.
+                    ' is in consultation but has no usable channel ('.
+                    var_export($sCanalAgente, TRUE).'), cannot redirect'.
+                    ' | ES: agente callback '.$sAgente.' está en consulta pero no tiene '.
+                    'canal utilizable, no se puede redirigir');
+                $sCanalAgente = NULL;
+            }
         }
 
-        $agentNumber = $llamada->agente->number;
         $this->_log->output('INFO: '.__METHOD__.': Customer hung up while agent '.
-            $sAgente.' is in consultation - redirecting to atxfer-complete to end consulting call'.
-            ' | EN: Customer hung up while agent '.$sAgente.
-            ' is in consultation - redirecting to atxfer-complete to end consulting call');
+            $sAgente.' is in consultation - redirecting '.$sCanalAgente.' to '.$sContexto.
+            ' to end consulting call | ES: el cliente colgó mientras el agente '.
+            $sAgente.' estaba en consulta - se redirige '.$sCanalAgente.' a '.$sContexto);
 
-        // Set the atxfer completion flag to suppress Agentlogoff
-        $this->_prepararAtxferComplete($sAgente);
-
-        // Redirect agent to atxfer-complete to terminate consultation and re-enter AgentLogin
-        $r = $this->_ami->Redirect(
-            $loginChannel,        // Channel: agent's login_channel
-            '',                   // ExtraChannel: not used
-            $agentNumber,         // Exten: agent number (e.g., 1001)
-            'atxfer-complete',    // Context
-            1                     // Priority
-        );
+        $r = is_null($sCanalAgente)
+            ? array('Response' => 'Failure', 'Message' => 'no usable agent channel')
+            : $this->_ami->Redirect(
+                $sCanalAgente,        // Channel: agent's login or call channel
+                '',                   // ExtraChannel: not used
+                $sExten,              // Exten: agent number, or 's'
+                $sContexto,           // Context
+                1                     // Priority
+            );
 
         if ($r['Response'] == 'Success') {
             $this->_log->output('DEBUG: '.__METHOD__.': Redirect successful for '.$sAgente.
@@ -3227,6 +3658,11 @@ Uniqueid: 1429642067.241008
 
         // Clear consultation state and emit ConsultationEnd
         unset($this->_agentesEnConsultation[$sAgente]);
+        unset($this->_agentesConsultaContestada[$sAgente]);
+        // Customer is gone and the call is about to be finalized as a normal
+        // hangup - clear any transfer stamped at consult-start so reports
+        // don't show this call as transferred to a colleague who never took it.
+        $this->_limpiarTransferPendiente($llamada);
         $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
             array('ConsultationEnd', array($sAgente))
         ));
@@ -3261,6 +3697,7 @@ Uniqueid: 1429642067.241008
                 $this->_log->output('DEBUG: '.__METHOD__.': clearing stale consultation state for '.$sAgente.
                     ' after attended transfer completion');
                 unset($this->_agentesEnConsultation[$sAgente]);
+                unset($this->_agentesConsultaContestada[$sAgente]);
                 $this->_tuberia->msg_ECCPProcess_emitirEventos(array(
                     array('ConsultationEnd', array($sAgente))
                 ));
@@ -3798,12 +4235,36 @@ Uniqueid: 1429642067.241008
                      */
 
                     if ($a->estado_consola == 'logged-in') {
-                        $this->_log->output('WARN: '.__METHOD__.' agente '.$sAgente.
-                            ' está logoneado en dialer pero en estado AGENT_LOGGEDOFF,'.
-                            ' se deslogonea en dialer... | EN: agent '.$sAgente.
-                            ' is logged in dialer but in state AGENT_LOGGEDOFF,'.
-                            ' logging off in dialer...');
-                        $this->_ejecutarLogoffAgente($sAgente, $a, $params['local_timestamp_received'], $params['Event']);
+                        if (isset($this->_agentesEnConsultation[$sAgente]) ||
+                                isset($this->_agentesEnAtxferComplete[$sAgente]) ||
+                                isset($this->_agentesConsultaContestada[$sAgente])) {
+                            /* El agente está en medio de una transferencia atendida:
+                             * su login_channel fue deliberadamente sacado (Redirect)
+                             * del bridge con AgentLogin(), asi que Asterisk reporta
+                             * AGENT_LOGGEDOFF de forma legitima pero temporal. No es
+                             * un logoff real - no tocar (mismo espiritu que la
+                             * excepcion de ingreso de clave, arriba). */
+                            /* EN: The agent is in the middle of an attended-transfer
+                             * consultation: its login_channel was deliberately
+                             * Redirected out of the AgentLogin() bridge, so Asterisk
+                             * legitimately but temporarily reports AGENT_LOGGEDOFF.
+                             * This is not a real logoff - do not touch it (same spirit
+                             * as the password-entry exception above). */
+                            if ($this->DEBUG) {
+                                $this->_log->output('DEBUG: '.__METHOD__.' agente '.$sAgente.
+                                    ' reporta AGENT_LOGGEDOFF pero esta en transferencia'.
+                                    ' atendida, se ignora. | EN: agent '.$sAgente.
+                                    ' reports AGENT_LOGGEDOFF but is in an attended'.
+                                    ' transfer, ignoring.');
+                            }
+                        } else {
+                            $this->_log->output('WARN: '.__METHOD__.' agente '.$sAgente.
+                                ' está logoneado en dialer pero en estado AGENT_LOGGEDOFF,'.
+                                ' se deslogonea en dialer... | EN: agent '.$sAgente.
+                                ' is logged in dialer but in state AGENT_LOGGEDOFF,'.
+                                ' logging off in dialer...');
+                            $this->_ejecutarLogoffAgente($sAgente, $a, $params['local_timestamp_received'], $params['Event']);
+                        }
                     }
                 } else {
                     /* Según Asterisk, el agente está logoneado. Se verifica si
@@ -4080,12 +4541,43 @@ Uniqueid: 1429642067.241008
         if (!is_null($a->llamada)) {
             $this->_log->output('WARN: agente '.$a->channel.' todavía tiene una '.
                 'llamada al procesar '.$evtname.', se cierra... | EN: agent '.$a->channel.' still has a call when processing '.$evtname.', closing...');
-            $r = $this->_ami->Hangup($a->llamada->agentchannel);
+            $llamada = $a->llamada;
+            $r = $this->_ami->Hangup($llamada->agentchannel);
             if ($r['Response'] != 'Success') {
                 $this->_log->output('ERR: No se puede colgar la llamada para '.$a->channel.
-                    ' ('.$a->llamada->agentchannel.') - '.$r['Message'].' | EN: Cannot hang up call for '.$a->channel.' ('.$a->llamada->agentchannel.') - ');
+                    ' ('.$llamada->agentchannel.') - '.$r['Message'].' | EN: Cannot hang up call for '.$a->channel.' ('.$llamada->agentchannel.') - ');
+                /* El comando Hangup fue rechazado (canal ya inexistente, nombre
+                 * obsoleto, etc.), asi que nunca va a llegar el evento Hangup
+                 * que limpiaria $a->llamada por la via normal. Sin esto el
+                 * agente queda "oncall" indefinidamente y no puede volver a
+                 * loguearse aunque el dialer ya lo dio de baja aqui. Se
+                 * finaliza el seguimiento de la llamada explicitamente para
+                 * evitar ese cuelgue. | EN: The Hangup command was rejected
+                 * (channel already gone, stale name, etc.), so the Hangup
+                 * event that would normally clear $a->llamada is never
+                 * coming. Without this the agent stays "oncall" indefinitely
+                 * and cannot log back in even though the dialer already
+                 * logged it off here. Explicitly finalize the call tracking
+                 * to avoid that lockup. */
+                $this->_procesarLlamadaColgada($llamada, array(
+                    'local_timestamp_received' => $timestamp,
+                    'Cause'                    => '0',
+                    'Cause-txt'                => 'Forced agent logoff ('.$evtname.')',
+                    'Channel'                  => $llamada->actualchannel,
+                    'Uniqueid'                 => $llamada->uniqueid,
+                ));
             }
         }
+
+        // El agente se va: ninguna bandera de consulta suya sigue teniendo
+        // sentido, y así los mapas no crecen sin límite.
+        // EN: the agent is leaving: none of its consultation flags mean
+        // anything any more, and this keeps the maps from growing unbounded.
+        unset($this->_agentesEnConsultation[$sAgente]);
+        unset($this->_agentesEnAtxferComplete[$sAgente]);
+        unset($this->_agentesConsultaContestada[$sAgente]);
+        unset($this->_ultimaConsultaFallida[$sAgente]);
+        unset($this->_consultaTerminadaEn[$sAgente]);
 
         $a->terminarLoginAgente($this->_ami, $timestamp);
     }

@@ -55,6 +55,59 @@ class ECCP
     private $_agentNumber = '';
     private $_agentPass = '';
 
+    /* Fijación (pinning) del certificado del servidor ECCP. Si ambos son NULL
+     * no se verifica nada y la conexión sólo va cifrada.
+     * EN: Pinning of the ECCP server certificate. If both are NULL nothing is
+     * verified and the connection is merely encrypted. */
+    private $_sCaFile = NULL;           // Certificado del que extraer la huella
+                                        // Certificate to take the fingerprint from
+    private $_sPeerFingerprint = NULL;  // Huella SHA-256 en hexadecimal
+                                        // SHA-256 fingerprint in hexadecimal
+
+    /**
+     * Fijar el certificado del servidor a partir de una copia del mismo. Con
+     * esto se impide un ataque de hombre en el medio: un atacante no puede
+     * presentar este certificado sin su clave privada. Se compara la huella
+     * SHA-256, no la cadena ni el nombre, así que se sigue pudiendo conectar
+     * por localhost, por nombre o por IP cruda indistintamente.
+     *
+     * EN: Pin the server certificate from a copy of it. This prevents a
+     * man-in-the-middle attack: an attacker cannot present this certificate
+     * without its private key. The SHA-256 fingerprint is compared, not the
+     * chain nor the name, so connecting by localhost, by name or by raw IP all
+     * keep working.
+     *
+     * Se puede activar globalmente definiendo la constante ECCP_CA_FILE.
+     * EN: It can be enabled globally by defining the ECCP_CA_FILE constant.
+     *
+     * @param   string  $sCaFile    Ruta a una copia del certificado del
+     *                              servidor (/etc/issabel/dialer/eccp.pem), o
+     *                              NULL para no verificar.
+     *                              EN: Path to a copy of the server
+     *                              certificate, or NULL for no verification.
+     */
+    public function setCaFile($sCaFile) { $this->_sCaFile = $sCaFile; }
+
+    /**
+     * Igual que setCaFile(), pero indicando directamente la huella SHA-256 del
+     * certificado, para clientes remotos que sólo tienen la huella y no una
+     * copia del certificado. La imprime eccp-cert.sh al instalarlo.
+     *
+     * EN: Same as setCaFile(), but giving the certificate's SHA-256
+     * fingerprint directly, for remote clients that only have the fingerprint
+     * and not a copy of the certificate. eccp-cert.sh prints it on install.
+     *
+     * @param   string  $sHuella    Huella SHA-256 en hexadecimal (se admiten
+     *                              los dos puntos y mayúsculas).
+     *                              EN: SHA-256 fingerprint in hexadecimal
+     *                              (colons and upper case are accepted).
+     */
+    public function setPeerFingerprint($sHuella)
+    {
+        $this->_sPeerFingerprint = is_null($sHuella)
+            ? NULL : strtolower(str_replace(':', '', $sHuella));
+    }
+
     /**
      * Procedimiento que inicia la conexión y el login al servidor ECCP.
      *
@@ -83,11 +136,58 @@ class ECCP
             $iPuerto = $c[1];
         }
 
-        // Iniciar la conexión
-        // EN: Start the connection
+        /* Iniciar la conexión. ECCP siempre viaja cifrado con TLS. No se
+         * verifica el certificado del servidor: el objetivo es impedir la
+         * captura pasiva de la clave y de los datos de llamadas, y así el
+         * dialer sigue siendo alcanzable por localhost, por nombre o por IP
+         * cruda aunque no haya DNS local o cambie la IP del servidor. */
+        /* EN: Start the connection. ECCP always travels TLS encrypted. The
+         * server certificate is not verified: the goal is to prevent passive
+         * capture of the password and of call data, and this way the dialer
+         * remains reachable by localhost, by name or by raw IP even with no
+         * local DNS or after the server IP changes. */
         $errno = $errstr = NULL;
-        $sUrlConexion = "tcp://$server:$iPuerto";
-        $this->_hConn = @stream_socket_client($sUrlConexion, $errno, $errstr);
+        $sUrlConexion = "tls://$server:$iPuerto";
+
+        $aOpcionesSSL = array(
+            'verify_peer'       =>  FALSE,
+            'verify_peer_name'  =>  FALSE,
+            'allow_self_signed' =>  TRUE,
+        );
+
+        /* Si se ha fijado el certificado del servidor (setCaFile(),
+         * setPeerFingerprint(), o las constantes ECCP_CA_FILE /
+         * ECCP_PEER_FINGERPRINT), se compara su huella SHA-256 y se aborta la
+         * conexión si no coincide. Eso sí detiene a un atacante en el medio.
+         * Se fija la huella y no la cadena ni el nombre, de modo que la
+         * verificación no ate la conexión a un nombre o a una IP concreta. */
+        /* EN: If the server certificate has been pinned (setCaFile(),
+         * setPeerFingerprint(), or the ECCP_CA_FILE / ECCP_PEER_FINGERPRINT
+         * constants), its SHA-256 fingerprint is compared and the connection is
+         * aborted on a mismatch. This does stop a man-in-the-middle. The
+         * fingerprint is pinned rather than the chain or the name, so that
+         * verification does not tie the connection to a given name or IP. */
+        $sHuella = $this->_sPeerFingerprint;
+        if (is_null($sHuella) && defined('ECCP_PEER_FINGERPRINT'))
+            $sHuella = strtolower(str_replace(':', '', ECCP_PEER_FINGERPRINT));
+
+        if (is_null($sHuella)) {
+            $sCaFile = $this->_sCaFile;
+            if (is_null($sCaFile) && defined('ECCP_CA_FILE')) $sCaFile = ECCP_CA_FILE;
+            if (!is_null($sCaFile) && is_readable($sCaFile)) {
+                $sHuella = @openssl_x509_fingerprint(file_get_contents($sCaFile), 'sha256');
+                if ($sHuella === FALSE) $sHuella = NULL;
+            }
+        }
+        if (!is_null($sHuella))
+            $aOpcionesSSL['peer_fingerprint'] = array('sha256' => $sHuella);
+
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT'))
+            $aOpcionesSSL['crypto_method'] = STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT;
+
+        $rContexto = stream_context_create(array('ssl' => $aOpcionesSSL));
+        $this->_hConn = @stream_socket_client($sUrlConexion, $errno, $errstr,
+            ini_get('default_socket_timeout'), STREAM_CLIENT_CONNECT, $rContexto);
         if (!$this->_hConn) throw new ECCPConnFailedException("$sUrlConexion: ($errno) $errstr", $errno);
 
         return $this->login($username, $secret);

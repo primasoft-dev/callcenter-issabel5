@@ -10,11 +10,41 @@ Issabel is an open source distribution and GUI for Unified Communications system
 
 It uses the [Asterisk©](http://www.asterisk.org/ "Asterisk Home Page") open source PBX software as its core.
 
-Call Center
+
+Callcenter Issabel 5
+==========
+
+Call Center Module for Issabel V5, Updated for installing on rocky 8 , with php compatiblle with v7.4 up to v8.0 , In callback and agent modes. 
+
+esta version puede ser instalada en asterisk 18 en IssabelPBX.
+This repo is tested with Issabel v5 and Asterisk 18, and it is no logner backward compatible with Issabel 4
+
+#### Version actualizada por la comunidad de Issabel, cualquier duda o problema escribir a https://t.me/IssabelPBXip:
+Gracias a la colaboracion de Nicolás Gudiño, Hamza ,Julio pacheco, y comunidad de Issabel en telegram
+
+
+## Installation Commands
 ----
 
-Call Center module for Issabel.
+```bash
+# Full installation (run as root)
+cd /usr/src
+git clone https://github.com/ISSABELPBX/callcenter-issabel5.git 
+cd callcenter-issabel5
+# For local installation:
+bash build/5.0/install-issabel-callcenter.sh -l
+# For production repo installation:
+bash build/5.0/install-issabel-callcenter.sh
+# To see what the installer does (options, installed files, ECCP TLS certificate):
+bash build/5.0/install-issabel-callcenter.sh -h
+# To Uninstall:
+bash build/5.0/remove-issabel-callcenter.sh
 
+# Service management
+systemctl start issabeldialer
+systemctl status issabeldialer
+systemctl stop issabeldialer
+```
 
 License
 ----
@@ -34,38 +64,3 @@ GPLv2 or Later
 >You should have received a copy of the GNU General Public License
 >along with this program; if not, write to the Free Software
 >Foundation, Inc., 51 Franklin Street, Fifth Floor, Bosto
-
-
-
-Callcenter Issabel 5
-==========
-
-Call Center Module V5.0.0-1, Updated for installing on rocky 8 , with php compatiblle with v5.4 up to v8.0 , In callback and agent modes. 
-
-esta version puede ser instalada en asterisk 18 en IssabelPBX.
-This repo is tested with Asterisk 18, and it is no logner backward compatible with Issabel 4
-
-#### Version actualizada por la comunidad de Issabel, cualquier duda o problema escribir a https://t.me/IssabelPBXip:
-Gracias a la colaboracion de Nicolás Gudiño, Hamza ,Julio pacheco, y comunidad de Issabel en telegram
-
-
-## Installation Commands
-----
-
-```bash
-# Full installation (run as root)
-cd /usr/src
-git clone https://github.com/ISSABELPBX/callcenter-issabel5.git 
-cd callcenter-issabel5
-# For local installation:
-bash build/5.0/install-issabel-callcenter.sh -l
-# For latest update installation:
-bash build/5.0/install-issabel-callcenter.sh
-# To Uninstall:
-bash build/5.0/remove-issabel-callcenter.sh
-
-# Service management
-systemctl start issabeldialer
-systemctl status issabeldialer
-systemctl stop issabeldialer
-```

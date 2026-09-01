@@ -1,7 +1,7 @@
 # ECCP Protocol v0.1
 **Revision 5 | Status: Beta**
 
-XML-based protocol for communication between external applications and the Issabel Call Center engine via TCP port **20005**.
+XML-based protocol for communication between external applications and the Issabel Call Center engine via TCP port **20005**, always **TLS encrypted**.
 
 ---
 
@@ -20,7 +20,7 @@ XML-based protocol for communication between external applications and the Issab
 ## Architecture
 
 ```
-Server (dialerd) <--TCP:20005--> Client (Agent Console)
+Server (dialerd) <--TLS over TCP:20005--> Client (Agent Console)
 ```
 
 **Concurrency Server**: An intermediary application can manage multiple agents through a single session, reducing server load.
@@ -29,9 +29,8 @@ Server (dialerd) <--TCP:20005--> Client (Agent Console)
 
 ## Sessions
 
+- Every connection is **TLS encrypted**; plaintext connections are dropped without a reply
 - Session established after successful authentication
-- Inactivity timeout: **5 minutes**
-- Authorized IPs only (others get "Connection refused")
 
 ---
 
@@ -57,6 +56,82 @@ Server (dialerd) <--TCP:20005--> Client (Agent Console)
     <request_name_response>...</request_name_response>
 </response>
 ```
+
+---
+
+## Transport security
+
+The ECCP port is **TLS 1.3 only** (negotiated suite: `TLS_AES_256_GCM_SHA384`).
+The server presents the certificate installed by
+`/opt/issabel/dialer/eccp-cert.sh` at `/etc/issabel/dialer/eccp.pem` (key in
+`eccp.key`, readable by the `asterisk` user): by default a dedicated,
+self-signed **ECDSA P-256** certificate generated at install time. It is
+generated rather than copied from Apache so that a pinned fingerprint never
+moves when the web certificate is renewed, because ECDSA signs the handshake far
+faster than RSA-2048, and to keep the ECCP identity separate from the web and
+SIP/WSS one. (It is not about hiding the web key from `asterisk`: Issabel
+already ships that key as `/etc/asterisk/keys/asterisk.pem`, owned by
+`asterisk`.) `ECCP_CERT_MODE=generate-san` adds SANs for clients that also want
+hostname verification, and `ECCP_CERT_MODE=copy` reuses Issabel's Apache
+certificate — sensible when that is a real CA-issued certificate. After a
+renewal, `eccp-cert.sh renew` refreshes the copy and restarts the dialer.
+
+### Default: encryption without verification
+
+Clients do not verify the certificate by default. This is deliberate: it keeps
+the dialer reachable over `localhost`, by hostname, or by raw IP with no local
+DNS, and neither an IP change nor certificate expiry can break connectivity.
+
+```php
+$ctx = stream_context_create(array('ssl' => array(
+    'verify_peer'       => FALSE,
+    'verify_peer_name'  => FALSE,
+    'allow_self_signed' => TRUE,
+)));
+$h = stream_socket_client('tls://localhost:20005', $errno, $errstr,
+    30, STREAM_CLIENT_CONNECT, $ctx);
+```
+
+This protects against **passive interception** of the login password and of call
+and contact data, but does **not** authenticate the server.
+
+### Optional: pin the certificate to stop a man-in-the-middle
+
+Deployments that need protection against an *active* attacker can pin the
+server certificate. The **SHA-256 fingerprint** is compared — not the chain and
+not the hostname — so pinning costs nothing in reachability: `localhost`,
+hostname and raw IP all keep working, and there is no SAN or DNS dependency.
+
+`eccp-cert.sh install` prints the fingerprint; `openssl x509 -in eccp.pem -noout
+-fingerprint -sha256` reprints it at any time.
+
+Using the `ECCP` client class:
+
+```php
+$e = new ECCP();
+$e->setCaFile('/etc/issabel/dialer/eccp.pem');   // local: point at the certificate
+// or, for a remote client that only has the fingerprint:
+$e->setPeerFingerprint('7B:79:E1:...:9B:F4');
+$e->connect('192.168.1.10', 'user', 'secret');
+```
+
+Or globally, without touching call sites, by defining either constant before the
+class is used: `ECCP_CA_FILE` or `ECCP_PEER_FINGERPRINT`.
+
+Raw PHP equivalent:
+
+```php
+$ctx = stream_context_create(array('ssl' => array(
+    'verify_peer'      => FALSE,
+    'verify_peer_name' => FALSE,
+    'peer_fingerprint' => array('sha256' => '7b79e133...'),
+)));
+```
+
+A server presenting any other certificate is refused before the login is sent.
+
+To inspect the connection while debugging, `telnet` no longer works — use
+`openssl s_client -connect localhost:20005`.
 
 ---
 

@@ -27,16 +27,12 @@ require_once '/var/lib/asterisk/agi-bin/phpagi-asmanager.php';
 require_once "libs/paloSantoJSON.class.php";
 require_once "libs/paloSantoDB.class.php";
 
-$webphonePassword = '';
-$webphoneName = '';
 $extension = '';
 
 function _moduleContent(&$smarty, $module_name)
 {
     global $arrConf;
     global $arrLang;
-    global $webphonePassword;
-    global $webphoneName;
     global $extension;
 
     require_once "modules/$module_name/libs/issabel2.lib.php";
@@ -49,29 +45,6 @@ function _moduleContent(&$smarty, $module_name)
     $pACL = new paloACL($pDB);
     $user = $_SESSION['issabel_user'];
     $extension = $pACL->getUserExtension($user);
-    $dsn1 = generarDSNSistema('asteriskuser', 'asterisk');
-    $pdbACL1 = new paloDB($dsn1);
-    $base_dir = "/var/www/html";
-
-    $resultado = $pdbACL1->fetchTable("SELECT data from sip WHERE id = '$extension' AND keyword = 'transport'");
-    $isWebphone = !empty($resultado) && isset($resultado[0]) ? $resultado[0] : '';
-    $webPhoneFolder = "$base_dir/modules/webphone";
-    $existeWebPhoneFolder = is_dir($webPhoneFolder);
-    //print_r($webPhoneFolder);
-    //print_r($isWebphone[0]);
-        if ($existeWebPhoneFolder) {
-            //$smarty->assign('webRTCFolder', $webPhoneFolder);
-            if (strpos($isWebphone[0], "wss") !== false || strpos($isWebphone[0], "ws") !== false) {
-                $webRTC = true;
-                $smarty->assign('webRTC', $webRTC);
-                $webphonePassword = $pdbACL1->fetchTable("SELECT data from sip WHERE id = '$extension' AND keyword = 'secret'; ")[0];
-                $webphoneName = $pdbACL1->fetchTable("SELECT name from users WHERE extension = '$extension';")[0];
-
-
-        }
-    }
-
-
 
     $astman = new AGI_AsteriskManager();
     if (!$astman->connect("127.0.0.1", 'admin' , obtenerClaveAMIAdmin())) {
@@ -655,11 +628,9 @@ function manejarSesionActiva_unimplemented($module_name, &$smarty, $sDirLocalPla
 function manejarSesionActiva_HTML($module_name, &$smarty, $sDirLocalPlantillas, $oPaloConsola, $estado, $listpanels)
 {
 
-    global $webphonePassword;
-    global $webphoneName;
     global $extension;
 
-    //var_dump($webphonePassword);
+
 
     // Incluir bibliotecas javascript de paneles
     $listaLibsJS_modulo = explode("\n", $smarty->get_template_vars('HEADER_MODULES'));
@@ -709,6 +680,11 @@ function manejarSesionActiva_HTML($module_name, &$smarty, $sDirLocalPlantillas, 
         'LBL_TRANSFER_BLIND'            =>  _tr('Blind transfer'),
         'LBL_TRANSFER_ATTENDED'         =>  _tr('Attended transfer'),
         'LBL_TRANSFER_AGENT'            =>  _tr('Transfer to agent'),
+        'LBL_COMPLETE_TRANSFER'         =>  _tr('Complete transfer'),
+        'LBL_CANCEL_TRANSFER'           =>  _tr('Cancel transfer'),
+        'MSG_TRANSFER_BUSY'             =>  _tr('Cannot transfer: colleague is busy'),
+        'MSG_TRANSFER_NOANSWER'         =>  _tr('Cannot transfer: colleague did not answer'),
+        'MSG_TRANSFER_UNAVAILABLE'      =>  _tr('Cannot transfer: colleague is unavailable'),
         'TITLE_SCHEDULE_CALL'           =>  _tr('Schedule call'),
         'LBL_SCHEDULE_CAMPAIGN_END'     =>  _tr('Call at end of campaign'),
         'LBL_SCHEDULE_BYDATE'           =>  _tr('Schedule at date'),
@@ -732,9 +708,16 @@ function manejarSesionActiva_HTML($module_name, &$smarty, $sDirLocalPlantillas, 
         'CALLINFO_CALLTYPE'             =>  '',
         'BTN_HOLD'                      =>  $estado['onhold'] ? _tr('End Hold') : _tr('Hold'),
         'BTN_GUARDAR_FORMULARIOS'       =>  _tr('Save data'),
-        'IS_AGENT_TYPE'                 =>  (strpos($_SESSION['callcenter']['agente'], 'Agent/') === 0),
     ));
     $estadoInicial = array(
+        /* 'consultation' se omite deliberadamente: la consola arranca en
+         * 'none' y, si el agente ya estaba en una consulta al cargar la
+         * página, el primer poll detecta la discrepancia y sintetiza el
+         * evento, dejando el botón Hangup con la etiqueta correcta. */
+        /* EN: 'consultation' is deliberately omitted: the console starts at
+         * 'none' and, if the agent was already in a consultation when the page
+         * loaded, the first poll spots the mismatch and synthesizes the event,
+         * leaving the Hangup button with the right label. */
         'onhold'            =>  $estado['onhold'],
         'break_id'          =>  is_null($estado['pauseinfo']) ? NULL : $estado['pauseinfo']['pauseid'],
         'calltype'          =>  NULL,
@@ -932,6 +915,39 @@ function manejarSesionActiva_HTML($module_name, &$smarty, $sDirLocalPlantillas, 
                         $_SESSION['callcenter']['ultimo_campaignform']),
         ));
     }
+
+    /* Barra naranja de llamada retenida. Va después de los bloques de arriba
+     * porque el de llamada activa asigna el verde incondicionalmente. Se toma
+     * el estado del servidor (no el del cliente) y el inicio real del hold, así
+     * que tras un F5 en mitad de una retención la barra vuelve en naranja y el
+     * cronómetro continúa desde donde iba en vez de reiniciarse a cero.
+     * describirEstadoBarra() decide lo mismo para el long-poll. */
+    /* EN: Orange bar for a held call. It comes after the blocks above because
+     * the active-call one assigns green unconditionally. It reads server state
+     * (not client state) and the real hold start, so after an F5 mid-hold the
+     * bar comes back orange and the timer continues from where it was instead
+     * of restarting at zero. describirEstadoBarra() makes the same decision for
+     * the long poll. */
+    if (describirEstadoBarra(array(
+            'calltype'      =>  is_null($estado['callinfo']) ? NULL : $estado['callinfo']['calltype'],
+            'onhold'        =>  $estado['onhold'],
+            'consultation'  =>  isset($estado['consultation']) ? $estado['consultation'] : 'none',
+            'waitingcall'   =>  !is_null($estado['waitedcallinfo']),
+            'break_id'      =>  is_null($estado['pauseinfo']) ? NULL : $estado['pauseinfo']['pauseid'],
+        )) == 'hold') {
+        $iDuracionHoldInicial = empty($estado['holdstart'])
+            ? 0 : time() - strtotime($estado['holdstart']);
+        $smarty->assign(array(
+            'CLASS_ESTADO_AGENTE_INICIAL'   =>  'issabel-callcenter-class-estado-hold',
+            'TEXTO_ESTADO_AGENTE_INICIAL'   =>  _tr('Call on hold'),
+            'CRONOMETRO'                    =>  sprintf('%02d:%02d:%02d',
+                ($iDuracionHoldInicial - ($iDuracionHoldInicial % 3600)) / 3600,
+                (($iDuracionHoldInicial - ($iDuracionHoldInicial % 60)) / 60) % 60,
+                $iDuracionHoldInicial % 60),
+        ));
+        $estadoInicial['timer_seconds'] = $iDuracionHoldInicial;
+    }
+
     $json = new Services_JSON();
     $smarty->assign(array(
         'APPLY_UI_STYLES'   =>  $json->encode(array(
@@ -967,21 +983,6 @@ function manejarSesionActiva_HTML($module_name, &$smarty, $sDirLocalPlantillas, 
     }
     $smarty->assign('CUSTOM_PANELS', $htmlpanels);
 
-
-        echo "<script>";
-        echo "localStorage.setItem('mhrgl.com.identity.display_name', '$extension');";
-        echo "localStorage.setItem('mhrgl.com.identity.impi', '$extension');";
-        echo "localStorage.setItem('mhrgl.com.identity.name', '$webphoneName[0]');";
-        echo "localStorage.setItem('mhrgl.com.identity.impu', 'sip:$extension@'+ window.location.hostname);";
-        echo "localStorage.setItem('mhrgl.com.identity.password', '$webphonePassword[0]');";
-        echo "localStorage.setItem('mhrgl.com.identity.realm', window.location.hostname);";
-        echo "localStorage.setItem('mhrgl.com.identity.socket', '8089');";
-        echo "localStorage.setItem('mhrgl.com.expert.disable_video', 'true');";
-        echo "localStorage.setItem('mhrgl.com.expert.disable_callbtn_options', 'true');";
-        echo "localStorage.setItem('mhrgl.com.expert.websocket_server_url', 'wss://' + window.location.hostname + ':8089/ws');";
-        //echo "localStorage.setItem('mhrgl.com.expert.ice_servers', '[]');";
-        echo "localStorage.setItem('mhrgl.com.expert.ice_servers', '[{ url: \'stun:stun.a.google.com:19302\'}]');";
-        echo "</script>";
 
     return $smarty->fetch("$sDirLocalPlantillas/agent_console.tpl") . _cc_debug_flush_html();
 }
@@ -1486,6 +1487,8 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
 
     $sNombrePausa = NULL;
     $iDuracionLlamada = NULL;
+    $sLinkStartLlamada = NULL;
+    $iDuracionHold = NULL;
     $iDuracionPausa = $iDuracionPausaActual = NULL;
 
     $estadoCliente = getParameter('clientstate');
@@ -1510,6 +1513,10 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
     $estadoCliente['waitingcall'] = isset($estadoCliente['waitingcall'])
         ? ($estadoCliente['waitingcall'] == 'true')
         : false;
+    if (!isset($estadoCliente['consultation']) ||
+            !in_array($estadoCliente['consultation'], array('none', 'ringing', 'answered'))) {
+        $estadoCliente['consultation'] = 'none';
+    }
 
     _debug(__FUNCTION__.' after sanitizing clientstate='.print_r($estadoCliente, TRUE));
 
@@ -1560,6 +1567,11 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
     }
 
     // Verificación de la consistencia del estado de hold
+    // Duración del hold en curso, para el cronómetro de la barra naranja
+    // EN: duration of the running hold, for the orange bar's timer
+    if ($estado['onhold'] && !empty($estado['holdstart'])) {
+        $iDuracionHold = time() - strtotime($estado['holdstart']);
+    }
     if (!$estadoCliente['onhold'] && $estado['onhold']) {
         // La consola debe de entrar en hold
         $respuesta[] = construirRespuesta_holdenter();
@@ -1571,7 +1583,8 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
     }
 
     if (!is_null($estado['callinfo'])) {
-        $iDuracionLlamada = time() - strtotime($estado['callinfo']['linkstart']);
+        $sLinkStartLlamada = $estado['callinfo']['linkstart'];
+        $iDuracionLlamada = time() - strtotime($sLinkStartLlamada);
     }
 
     // Verificación de atención a llamada
@@ -1607,8 +1620,78 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
         _debug(__FUNCTION__.' initial: agent has received call');
     } elseif (!is_null($estadoCliente['calltype']) && is_null($estado['callinfo'])) {
         // La consola dejó de atender una llamada
-        $respuesta[] = construirRespuesta_agentunlinked();
+        $infoCampania = array();
+        if (!($estadoCliente['calltype'] == 'incoming' && is_null($estadoCliente['campaign_id']))) {
+            $infoCampania = $oPaloConsola->leerInfoCampania(
+                $estadoCliente['calltype'],
+                $estadoCliente['campaign_id']);
+        }
+        if (!is_array($infoCampania)) $infoCampania = array();
+        $infoCampania['forms'] = NULL;
+
+        $callinfoHangup = array(
+            'calltype'    => $estadoCliente['calltype'],
+            'campaign_id' => $estadoCliente['campaign_id'],
+            'callid'      => $estadoCliente['callid'],
+            'callnumber'  => NULL,
+            'linkstart'   => NULL,
+        );
+        $infoLlamadaHangup = $oPaloConsola->leerInfoLlamada(
+            $estadoCliente['calltype'],
+            $estadoCliente['campaign_id'],
+            $estadoCliente['callid']);
+        if (!is_array($infoLlamadaHangup)) $infoLlamadaHangup = array();
+        foreach (array('agent_number', 'remote_channel', 'uniqueid',
+            'campaign_id', 'callid', 'calltype', 'callnumber') as $k) {
+            if (!isset($infoLlamadaHangup[$k]))
+                $infoLlamadaHangup[$k] = isset($callinfoHangup[$k]) ? $callinfoHangup[$k] : NULL;
+        }
+
+        $respuesta[] = construirRespuesta_agentunlinked($smarty, $sDirLocalPlantillas,
+            $oPaloConsola, $callinfoHangup, $infoLlamadaHangup, $infoCampania);
         _debug(__FUNCTION__.' initial: agent has ended call');
+    }
+
+    /* Verificación de la consistencia del estado de consulta de transferencia
+     * atendida. Los eventos ConsultationStart/Answered/End sólo llegan a los
+     * clientes ECCP conectados en ese instante, así que la consola puede
+     * perder uno mientras su long-poll se está reconectando y quedarse con el
+     * botón Hangup mostrando "Cancel transfer" hasta recargar la página. Aquí
+     * se compara contra el estado real y se sintetiza el evento faltante, tal
+     * como ya se hace arriba con break y hold. */
+    /* EN: Attended-transfer consultation state consistency check. The
+     * ConsultationStart/Answered/End events only reach ECCP clients connected
+     * at that very instant, so the console can miss one while its long poll is
+     * reconnecting and be left with the Hangup button stuck showing "Cancel
+     * transfer" until the page is reloaded. Compare against the real state and
+     * synthesize the missing event, exactly as break and hold do above. */
+    $sConsultaReal = isset($estado['consultation']) ? $estado['consultation'] : 'none';
+    if ($sConsultaReal != $estadoCliente['consultation']) {
+        switch ($sConsultaReal) {
+        case 'ringing':
+            $respuesta[] = array('event' => 'consultationstart');
+            break;
+        case 'answered':
+            $respuesta[] = array('event' => 'consultationanswered');
+            break;
+        default:
+            /* Se adjunta el motivo guardado por el dialer (BUSY/NOANSWER/...)
+             * para que el aviso al agente aparezca también cuando el evento
+             * ConsultationEnd original se perdió, que es justo lo que ocurre
+             * casi siempre con el colega ocupado. */
+            /* EN: Attach the reason the dialer stored (BUSY/NOANSWER/...) so
+             * the agent still gets the notice when the original ConsultationEnd
+             * event was lost, which is exactly what almost always happens with
+             * a busy colleague. */
+            $respuesta[] = array(
+                'event'  => 'consultationend',
+                'reason' => (isset($estado['consultation_reason']) && $estado['consultation_reason'] !== '')
+                    ? $estado['consultation_reason'] : NULL,
+            );
+            break;
+        }
+        _debug(__FUNCTION__.' initial: consultation state resynced to '.$sConsultaReal.
+            ' reason='.(isset($estado['consultation_reason']) ? $estado['consultation_reason'] : '(none)'));
     }
 
     // Verificación de espera de llamada
@@ -1727,7 +1810,8 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
                         'callid'        =>  $evento['call_id'],
                         'callnumber'    =>  $evento['phone'],
                     );
-                    $iDuracionLlamada = time() - strtotime($nuevoEstado['linkstart']);
+                    $sLinkStartLlamada = $nuevoEstado['linkstart'];
+                    $iDuracionLlamada = time() - strtotime($sLinkStartLlamada);
 
                     // Leer información del formulario de la campaña
                     if ($nuevoEstado['calltype'] == 'incoming' && is_null($nuevoEstado['campaign_id'])) {
@@ -1759,7 +1843,23 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
                 if (!(isset($evento['agent_number']) && $evento['agent_number'] == $sAgente)) break;
                 unset($respuestaEventos['llamada']);
                 if (!is_null($estadoCliente['calltype'])) {
-                    $respuestaEventos['llamada'] = construirRespuesta_agentunlinked();
+                    $nuevoEstado = array(
+                        'calltype'      =>  $evento['call_type'],
+                        'campaign_id'   =>  $evento['campaign_id'],
+                        'linkstart'     =>  isset($evento['datetime_linkstart']) ? $evento['datetime_linkstart'] : NULL,
+                        'callid'        =>  $evento['call_id'],
+                        'callnumber'    =>  isset($evento['phone']) ? $evento['phone'] : NULL,
+                    );
+                    if ($nuevoEstado['calltype'] == 'incoming' && is_null($nuevoEstado['campaign_id'])) {
+                        $infoCampania = array('forms' => NULL);
+                    } else {
+                        $infoCampania = $oPaloConsola->leerInfoCampania(
+                            $nuevoEstado['calltype'],
+                            $nuevoEstado['campaign_id']);
+                    }
+                    $respuestaEventos['llamada'] = construirRespuesta_agentunlinked(
+                        $smarty, $sDirLocalPlantillas, $oPaloConsola,
+                        $nuevoEstado, $evento, $infoCampania);
                 }
                 break;
             case 'schedulecallstart':
@@ -1785,7 +1885,14 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
                 break;
             case 'consultationend':
                 if (!(isset($evento['agent_number']) && $evento['agent_number'] == $sAgente)) break;
-                $respuestaEventos['consultation'] = array('event' => 'consultationend');
+                $respuestaEventos['consultation'] = array(
+                    'event'  => 'consultationend',
+                    'reason' => isset($evento['reason']) ? $evento['reason'] : NULL,
+                );
+                break;
+            case 'consultationanswered':
+                if (!(isset($evento['agent_number']) && $evento['agent_number'] == $sAgente)) break;
+                $respuestaEventos['consultation'] = array('event' => 'consultationanswered');
                 break;
             }
         } // while(...)
@@ -1835,6 +1942,21 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
             _debug(__FUNCTION__.' '.$evento['event'].': does not modify clientstate');
             break;
         }
+        /* El long-poll se bloquea hasta que llega un evento, así que la
+         * duración calculada al inicio de la petición puede tener muchos
+         * segundos de retraso cuando por fin se usa aquí. Se recalcula en el
+         * momento de usarla, o el cronómetro arrancaría atrasado justo esos
+         * segundos: se nota al salir de un hold, donde la barra vuelve a
+         * "llamada" mucho después de haberse calculado. */
+        /* EN: The long poll blocks until an event arrives, so the duration
+         * computed at the start of the request can be many seconds stale by
+         * the time it is used here. Recompute it at the point of use, or the
+         * timer starts exactly that many seconds behind - visible when leaving
+         * a hold, where the bar returns to "llamada" long after the value was
+         * computed. */
+        if (!is_null($sLinkStartLlamada)) {
+            $iDuracionLlamada = time() - strtotime($sLinkStartLlamada);
+        }
         $sDescFinal = describirEstadoBarra($estadoCliente);
         $iPosEvento = count($respuesta) - 1;
         _debug(__FUNCTION__.' old barstate '.$sDescInicial.' new barstate '.$sDescFinal);
@@ -1848,6 +1970,12 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
             $respuesta[$iPosEvento]['txt_estado_agente_inicial'] = _tr('On break').': '.$sNombrePausa;
             $respuesta[$iPosEvento]['class_estado_agente_inicial'] = 'issabel-callcenter-class-estado-break';
             $respuesta[$iPosEvento]['timer_seconds'] = $iDuracionPausa;
+            break;
+        case 'hold':
+            $respuesta[$iPosEvento]['txt_estado_agente_inicial'] = _tr('Call on hold');
+            $respuesta[$iPosEvento]['class_estado_agente_inicial'] = 'issabel-callcenter-class-estado-hold';
+            // Timer for the current hold, not the call and not the shift total
+            $respuesta[$iPosEvento]['timer_seconds'] = is_null($iDuracionHold) ? 0 : $iDuracionHold;
             break;
         case 'esperando':
             $respuesta[$iPosEvento]['txt_estado_agente_inicial'] = _tr('Waiting for call');
@@ -1908,8 +2036,26 @@ function manejarSesionActiva_checkStatus($module_name, $smarty,
  */
 function describirEstadoBarra($estado)
 {
-    if (!is_null($estado['calltype']))
+    if (!is_null($estado['calltype'])) {
+        /* El hold es un refinamiento de "en llamada", así que se comprueba
+         * dentro de esta rama y se conserva la precedencia actual (un break
+         * tomado durante una llamada sigue mostrándose en verde).
+         *
+         * Nunca durante una consulta de transferencia atendida: ahí el cliente
+         * también escucha música, pero el agente está hablando con un colega,
+         * no reteniendo la llamada. */
+        /* EN: A hold is a refinement of "on a call", so it is checked inside
+         * this branch and the existing precedence is preserved (a break taken
+         * during a call still shows green).
+         *
+         * Never during an attended-transfer consultation: the customer hears
+         * music there too, but the agent is talking to a colleague rather than
+         * holding the call. */
+        if (!empty($estado['onhold']) &&
+                (!isset($estado['consultation']) || $estado['consultation'] == 'none'))
+            return 'hold';
         return 'llamada';
+    }
     if ($estado['waitingcall'])
         return 'esperando';
     if (!is_null($estado['break_id']))
@@ -2012,6 +2158,16 @@ function construirRespuesta_agentlinked($smarty, $sDirLocalPlantillas,
         $registroCambio['url3'] = construirUrlExterno($infoCampania['urltemplate3'], $infoLlamada, $chanvars);
     }
 
+    // URLs marked with a "_hangup" opentype are reserved for the agentunlinked
+    // event and must not pop at call startup.
+    foreach (array('', '2', '3') as $sfx) {
+        if (_esOpentypeHangup($registroCambio["urlopentype$sfx"])) {
+            $registroCambio["urlopentype$sfx"]    = NULL;
+            $registroCambio["urldescription$sfx"] = NULL;
+            $registroCambio["url$sfx"]            = NULL;
+        }
+    }
+
     // Asignaciones específicas para llamadas entrantes
     if ($callinfo['calltype'] == 'incoming') {
         $comboContactos = array();
@@ -2065,11 +2221,42 @@ function construirRespuesta_agentlinked($smarty, $sDirLocalPlantillas,
     return $registroCambio;
 }
 
-function construirRespuesta_agentunlinked()
+function construirRespuesta_agentunlinked($smarty = NULL, $sDirLocalPlantillas = NULL,
+    $oPaloConsola = NULL, $callinfo = NULL, $infoLlamada = NULL, &$infoCampania = NULL)
 {
-    return array(
-        'event'     =>  'agentunlinked',
-    );
+    $registroCambio = array('event' => 'agentunlinked');
+    if (!is_array($infoCampania) || is_null($oPaloConsola) || !is_array($infoLlamada)) {
+        return $registroCambio;
+    }
+
+    // The agentunlinked event uses field names call_type/call_id/phone, but
+    // construirUrlExterno expects calltype/callid/callnumber. Merge the
+    // normalized $callinfo (built by the caller with the proper key names)
+    // into $infoLlamada so URL token substitution works.
+    if (is_array($callinfo)) {
+        foreach (array('calltype', 'campaign_id', 'callid', 'callnumber',
+            'agent_number', 'remote_channel', 'uniqueid', 'datetime_linkstart') as $k) {
+            if (!isset($infoLlamada[$k]) && isset($callinfo[$k]))
+                $infoLlamada[$k] = $callinfo[$k];
+        }
+    }
+
+    $chanvars = $oPaloConsola->leerVariablesCanalLlamadaActiva();
+    foreach (array('', '2', '3') as $sfx) {
+        $ot   = isset($infoCampania["urlopentype$sfx"])    ? $infoCampania["urlopentype$sfx"]    : NULL;
+        $tpl  = isset($infoCampania["urltemplate$sfx"])    ? $infoCampania["urltemplate$sfx"]    : NULL;
+        $desc = isset($infoCampania["urldescription$sfx"]) ? $infoCampania["urldescription$sfx"] : NULL;
+        if (_esOpentypeHangup($ot) && !is_null($tpl)) {
+            $registroCambio["urlopentype$sfx"]    = _opentypeBase($ot);
+            $registroCambio["urldescription$sfx"] = $desc;
+            $registroCambio["url$sfx"]            = construirUrlExterno($tpl, $infoLlamada, $chanvars);
+        } else {
+            $registroCambio["urlopentype$sfx"]    = NULL;
+            $registroCambio["urldescription$sfx"] = NULL;
+            $registroCambio["url$sfx"]            = NULL;
+        }
+    }
+    return $registroCambio;
 }
 
 function construirRespuesta_waitingenter($oPaloConsola, $waitedcallinfo)
@@ -2102,6 +2289,16 @@ function construirRespuesta_waitingexit()
     );
 }
 
+function _esOpentypeHangup($opentype)
+{
+    return is_string($opentype) && substr($opentype, -7) === '_hangup';
+}
+
+function _opentypeBase($opentype)
+{
+    return _esOpentypeHangup($opentype) ? substr($opentype, 0, -7) : $opentype;
+}
+
 function construirUrlExterno($s, $infoLlamada, $chanvars)
 {
     $reemplazos = array(
@@ -2109,12 +2306,17 @@ function construirUrlExterno($s, $infoLlamada, $chanvars)
                 ? $infoLlamada['agent_number'] : ''),
         '{__REMOTE_CHANNEL__}'  =>  (isset($infoLlamada['remote_channel'])
                 ? $infoLlamada['remote_channel'] : ''),
-        '{__CALL_TYPE__}'       =>  $infoLlamada['calltype'],
-        '{__CAMPAIGN_ID__}'     =>  $infoLlamada['campaign_id'],
-        '{__CALL_ID__}'         =>  $infoLlamada['callid'],
-        '{__PHONE__}'           =>  $infoLlamada['callnumber'],
-        '{__UNIQUEID__}'        =>  $infoLlamada['uniqueid'],
-        '{__AGENT__}'           =>  trim(substr($_SESSION['callcenter']['agente_nombre'], strpos($_SESSION['callcenter']['agente_nombre'], '-') +1)),
+        '{__CALL_TYPE__}'       =>  isset($infoLlamada['calltype']) ? $infoLlamada['calltype'] : '',
+        '{__CAMPAIGN_ID__}'     =>  isset($infoLlamada['campaign_id']) ? $infoLlamada['campaign_id'] : '',
+        '{__CALL_ID__}'         =>  isset($infoLlamada['callid']) ? $infoLlamada['callid'] : '',
+        '{__PHONE__}'           =>  isset($infoLlamada['callnumber']) ? $infoLlamada['callnumber'] : '',
+        '{__UNIQUEID__}'        =>  isset($infoLlamada['uniqueid']) ? $infoLlamada['uniqueid'] : '',
+        '{__ANSWER__}'          =>  isset($infoLlamada['datetime_linkstart']) ? $infoLlamada['datetime_linkstart'] : '',
+        '{__END__}'             =>  isset($infoLlamada['datetime_linkend']) ? $infoLlamada['datetime_linkend'] : '',
+        '{__DURATION__}'        =>  isset($infoLlamada['duration']) ? $infoLlamada['duration'] : '',
+        '{__AGENT__}'           =>  isset($_SESSION['callcenter']['agente_nombre'])
+                ? trim(substr($_SESSION['callcenter']['agente_nombre'], strpos($_SESSION['callcenter']['agente_nombre'], '-') + 1))
+                : '',
     );
     if (is_array($chanvars)) foreach ($chanvars as $k => $v) {
     	$reemplazos['{'.$k.'}'] = $v;

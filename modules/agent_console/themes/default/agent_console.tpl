@@ -117,20 +117,6 @@
                 </div>
     		</div>{* issabel-callcenter-contenido *}
             
-            {if $webRTC}
-                    <div class="webPhoneContainer" id="webPhoneContainer">    
-                        {include file="/var/www/html/modules/webphone/webRTC_CC/webRTC.php"}
-                    </div>
-                <div class="right-container">
-                    <li class="webPhonePanel">
-                        <div class="webPhonePosition" id="webPhonePosition">
-                            <dt>Web Phone</dt>
-                        </div>
-                    </li>
-                </div>
-            {/if}
-
-
 	</div>
 </div>{* issabel-callcenter-area-principal *}
 <div id="issabel-callcenter-seleccion-break" title="{$TITLE_BREAK_DIALOG}">
@@ -150,9 +136,7 @@
                 <td>
                     <div align="center" id="transfer_type_radio">
                         <input type="radio" id="transfer_type_blind" name="transfer_type" value="blind" checked="checked"/><label for="transfer_type_blind">{$LBL_TRANSFER_BLIND}</label>
-                        {if !$IS_AGENT_TYPE}
                         <input type="radio" id="transfer_type_attended" name="transfer_type" value="attended" /><label for="transfer_type_attended">{$LBL_TRANSFER_ATTENDED}</label>
-                        {/if}
                         <input type="radio" id="transfer_type_agent" name="transfer_type" value="agent" /><label for="transfer_type_agent">{$LBL_TRANSFER_AGENT}</label>
                     </div>
                 </td>
@@ -257,14 +241,12 @@ $(document).ready(function() {
 {/literal}
     apply_ui_styles({$APPLY_UI_STYLES});
     initialize_client_state({$INITIAL_CLIENT_STATE});
+    lblCompleteTransfer = "{$LBL_COMPLETE_TRANSFER|escape:'javascript'}";
+    lblCancelTransfer = "{$LBL_CANCEL_TRANSFER|escape:'javascript'}";
+    msgTransferBusy = "{$MSG_TRANSFER_BUSY|escape:'javascript'}";
+    msgTransferNoAnswer = "{$MSG_TRANSFER_NOANSWER|escape:'javascript'}";
+    msgTransferUnavailable = "{$MSG_TRANSFER_UNAVAILABLE|escape:'javascript'}";
 {literal}
 });
-
-    var container = $('#webPhoneContainer');
-    var positionDiv = $('#webPhonePosition');
-
-    if (container.is(':hidden')) {
-        container.appendTo(positionDiv).show();
-    }
 </script>
 {/literal}

@@ -99,8 +99,13 @@ function listCampaign($pDB, $smarty, $module_name, $local_templates_dir)
         $id_campaign = $_POST['id_campaign'];
 
     // Revisar si se debe de borrar una campaña elegida
-    if (isset($_POST['delete']) && !is_null($id_campaign)) {
-        if($oCampaign->delete_campaign($id_campaign)) {
+    if (isset($_POST['delete'])) {
+        if (is_null($id_campaign)) {
+            // No se ha elegido ninguna campaña con el radio button
+            // EN: No campaign has been chosen with the radio button
+            $smarty->assign("mb_title",_tr('Delete Error'));
+            $smarty->assign("mb_message", _tr('You must select a campaign'));
+        } elseif ($oCampaign->delete_campaign($id_campaign)) {
             $smarty->assign("mb_title",_tr('Message'));
             $smarty->assign("mb_message", _tr('Campaign was deleted successfully'));
         } else {
@@ -110,9 +115,32 @@ function listCampaign($pDB, $smarty, $module_name, $local_templates_dir)
         }
     }
 
+    // Purgar las llamadas pendientes de la campaña elegida
+    // EN: Purge the pending calls of the chosen campaign
+    if (isset($_POST['purge_pending'])) {
+        if (is_null($id_campaign)) {
+            // No se ha elegido ninguna campaña con el radio button
+            // EN: No campaign has been chosen with the radio button
+            $smarty->assign("mb_title",_tr('Purge Error'));
+            $smarty->assign("mb_message", _tr('You must select a campaign'));
+        } elseif ($oCampaign->purge_pending_calls($id_campaign)) {
+            $smarty->assign("mb_title",_tr('Message'));
+            $smarty->assign("mb_message", _tr('Pending calls were purged successfully'));
+        } else {
+            $msg_error = ($oCampaign->errMsg!="") ? "<br/>".$oCampaign->errMsg:"";
+            $smarty->assign("mb_title",_tr('Purge Error'));
+            $smarty->assign("mb_message", _tr('Error when purging pending calls').$msg_error);
+        }
+    }
+
     // Activar o desactivar campañas elegidas
-    if (isset($_POST['change_status']) && !is_null($id_campaign)){
-        if($_POST['status_campaing_sel']=='activate'){
+    if (isset($_POST['change_status'])){
+        if (is_null($id_campaign)) {
+            // No se ha elegido ninguna campaña con el radio button
+            // EN: No campaign has been chosen with the radio button
+            $smarty->assign("mb_title",_tr('Change Status Error'));
+            $smarty->assign("mb_message", _tr('You must select a campaign'));
+        } elseif($_POST['status_campaing_sel']=='activate'){
             if(!$oCampaign->activar_campaign($id_campaign, 'A')) {
                 $smarty->assign("mb_title", _tr('Activate Error'));
                 $smarty->assign("mb_message", _tr('Error when Activating the Campaign').': '.$oCampaign->errMsg);
@@ -201,7 +229,29 @@ function listCampaign($pDB, $smarty, $module_name, $local_templates_dir)
         'activate'      =>  _tr('Activate'),
         'deactivate'    =>  _tr('Desactivate'),
     ), null, 'change_status');
-    $oGrid->deleteList('Are you sure you wish to delete campaign?', 'delete', _tr('Delete'));
+
+    // Validación en el cliente: debe haber una campaña elegida (radio button)
+    // antes de confirmar cualquier acción por fila
+    // EN: Client-side validation: a campaign must be chosen (radio button)
+    // before confirming any per-row action
+    $js_check_campaign = "var r=document.getElementsByName('id_campaign');var s=false;"
+        ."for(var i=0;i<r.length;i++){if(r[i].checked){s=true;break;}} "
+        ."if(!s){alert('"._tr('You must select a campaign')."');return false;} ";
+
+    // Botón de borrado que valida la selección antes de confirmar. Replica la
+    // salida de deleteList() (icono y color rojo) porque ésta no acepta un
+    // onclick propio y arrActions es privado.
+    // EN: Delete button that validates the selection before confirming.
+    // Replicates deleteList() output (icon and red color) because it accepts
+    // no custom onclick and arrActions is private.
+    $oGrid->addHTMLAction(
+        "<button type=\"submit\" name=\"delete\" value=\""._tr('Delete')."\" class=\"neo-table-toolbar-button\" ".
+        "style=\"background-color:#ec6459; border:1px solid #ec6459;\" ".
+        "onclick=\"".$js_check_campaign."return confirmSubmit('"._tr('Are you sure you wish to delete campaign?')."');\">".
+        "<i class=\"fa fa-eraser\"></i> "._tr('Delete')."</button>");
+
+    $oGrid->addSubmitAction('purge_pending', _tr('Purge Pending Calls'), 'trash-o',
+        $js_check_campaign."return confirmSubmit('"._tr('Are you sure you wish to purge pending calls for this campaign?')."')");
     $oGrid->setData($arrData);
     $oGrid->showFilter($smarty->fetch("$local_templates_dir/filter-list-campaign.tpl"));
     return $oGrid->fetchGrid();

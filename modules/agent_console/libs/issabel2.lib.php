@@ -408,12 +408,23 @@ function _cc_debug_flush_html()
 
     $output = "<script>\n";
     foreach ($GLOBALS['_CC_DEBUG_MESSAGES'] as $msg) {
-        // TODO: Fix XSS - use htmlspecialchars($msg, ENT_QUOTES, 'UTF-8') instead of manual escaping
-        // Currently kept to avoid breaking reporting functionality
-        // ES: TODO: Corregir XSS - usar htmlspecialchars en lugar de escape manual
-        $escaped = str_replace(array("\\", "'", "\n", "\r", "</"),
-                               array("\\\\", "\\'", "\\n", "\\r", "<\\/"), $msg);
-        $output .= "console.log('[CC_DEBUG] ' + '" . $escaped . "');\n";
+        // Safely embed $msg as a JSON/JS string literal. json_encode() escapes
+        // quotes, backslashes and control characters, and (with JSON_HEX_TAG)
+        // encodes '<' and '>' so a literal "</script>" can never appear in the
+        // output and break out of this <script> block.
+        // ES: Incrustar $msg de forma segura como literal JSON/JS. json_encode()
+        // escapa comillas, barras invertidas y caracteres de control, y con
+        // JSON_HEX_TAG codifica '<' y '>' para que nunca aparezca un
+        // "</script>" literal que rompa este bloque <script>.
+        $safeMsg = json_encode((string)$msg, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE);
+        if ($safeMsg === false) {
+            // Encoding failed (e.g. invalid UTF-8) - emit a safe placeholder
+            // instead of risking raw/unescaped content reaching the page.
+            // ES: Fallo la codificacion (p.ej. UTF-8 invalido) - emitir un
+            // marcador seguro en vez de arriesgar contenido sin escapar.
+            $safeMsg = json_encode('[unencodable debug message omitted]');
+        }
+        $output .= "console.log('[CC_DEBUG] ' + " . $safeMsg . ");\n";
     }
     $output .= "</script>\n";
 

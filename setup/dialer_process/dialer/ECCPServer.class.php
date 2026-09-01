@@ -30,9 +30,9 @@ class ECCPServer extends MultiplexServer
 
     // Constructor con objeto adicional de tubería
     // Constructor with additional pipe object
-    function __construct($sUrlSocket, &$oLog, $tuberia)
+    function __construct($sUrlSocket, &$oLog, $tuberia, $rContextoSSL = NULL)
     {
-    	parent::__construct($sUrlSocket, $oLog);
+    	parent::__construct($sUrlSocket, $oLog, $rContextoSSL);
         $this->_tuberia = $tuberia;
     }
 

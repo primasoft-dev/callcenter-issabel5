@@ -22,6 +22,13 @@
   +----------------------------------------------------------------------+
   $Id: DialerProcess.class.php,v 1.48 2009/03/26 13:46:58 alex Exp $ */
 
+/* Material TLS por omisión del listener ECCP. Lo instala eccp-cert.sh, que es
+ * invocado por los scripts de instalación del módulo. */
+/* Default TLS material of the ECCP listener. It is installed by eccp-cert.sh,
+ * which is invoked by the module installation scripts. */
+define('ECCP_TLS_CERT', '/etc/issabel/dialer/eccp.pem');
+define('ECCP_TLS_KEY',  '/etc/issabel/dialer/eccp.key');
+
 class ECCPProcess extends TuberiaProcess
 {
     private $DEBUG = FALSE; // VERDADERO si se activa la depuración
@@ -41,7 +48,89 @@ class ECCPProcess extends TuberiaProcess
     public function inicioPostDemonio($infoConfig, &$oMainLog)
     {
     	$this->_log = $oMainLog;
-        $this->_multiplex = new ECCPServer('tcp://0.0.0.0:20005', $this->_log, $this->_tuberia);
+
+        /* El puerto ECCP siempre va cifrado con TLS. El cliente no verifica el
+         * certificado (sólo cifrado, sin autenticación del servidor), así que
+         * el dialer sigue siendo alcanzable por localhost, por nombre o por IP
+         * sin depender de DNS ni de los SAN del certificado. */
+        /* The ECCP port is always TLS encrypted. The client does not verify the
+         * certificate (encryption only, no server authentication), so the dialer
+         * remains reachable by localhost, by name or by IP without depending on
+         * DNS or on the certificate SANs. */
+        $sCertTLS = ECCP_TLS_CERT;
+        $sClaveTLS = ECCP_TLS_KEY;
+        if (isset($infoConfig['eccp']['tls_cert'])) $sCertTLS = $infoConfig['eccp']['tls_cert'];
+        if (isset($infoConfig['eccp']['tls_key']))  $sClaveTLS = $infoConfig['eccp']['tls_key'];
+
+        /* Se falla en cerrado: sin certificado utilizable no se levanta el
+         * listener, en lugar de exponer ECCP en texto claro. */
+        /* Fail closed: without usable certificate material the listener is not
+         * started, instead of exposing ECCP in plain text. */
+        $sPistaEs = ' - ejecute /opt/issabel/dialer/eccp-cert.sh install';
+        $sPistaEn = ' - run /opt/issabel/dialer/eccp-cert.sh install';
+        if (!is_readable($sCertTLS) || !is_readable($sClaveTLS)) {
+            $this->_log->output(
+                "FATAL: no se puede leer el certificado TLS de ECCP ($sCertTLS / $sClaveTLS)". $sPistaEs.
+                " | EN: FATAL: cannot read the ECCP TLS certificate ($sCertTLS / $sClaveTLS)". $sPistaEn);
+            return FALSE;
+        }
+
+        /* No basta con que los ficheros existan: un certificado ilegible para
+         * OpenSSL, o una clave que no le corresponde, dejarían el puerto
+         * abierto mientras fallan todas las negociaciones, que es mucho más
+         * difícil de diagnosticar que no arrancar. */
+        /* It is not enough for the files to exist: a certificate OpenSSL
+         * cannot parse, or a key that does not belong to it, would leave the
+         * port open while every negotiation fails, which is far harder to
+         * diagnose than not starting at all. */
+        $rCertTLS = @openssl_x509_read(file_get_contents($sCertTLS));
+        if ($rCertTLS === FALSE) {
+            $this->_log->output(
+                "FATAL: el certificado TLS de ECCP no es válido ($sCertTLS)". $sPistaEs.
+                " | EN: FATAL: the ECCP TLS certificate is not valid ($sCertTLS)". $sPistaEn);
+            return FALSE;
+        }
+        if (@openssl_pkey_get_private(file_get_contents($sClaveTLS)) === FALSE) {
+            $this->_log->output(
+                "FATAL: la clave privada TLS de ECCP no es válida ($sClaveTLS)". $sPistaEs.
+                " | EN: FATAL: the ECCP TLS private key is not valid ($sClaveTLS)". $sPistaEn);
+            return FALSE;
+        }
+        if (!@openssl_x509_check_private_key($rCertTLS, file_get_contents($sClaveTLS))) {
+            $this->_log->output(
+                "FATAL: la clave privada TLS de ECCP no corresponde al certificado".
+                " ($sClaveTLS / $sCertTLS)".$sPistaEs.
+                " | EN: FATAL: the ECCP TLS private key does not match the certificate".
+                " ($sClaveTLS / $sCertTLS)".$sPistaEn);
+            return FALSE;
+        }
+
+        /* Un certificado vencido no impide cifrar, porque el cliente no lo
+         * verifica, pero suele indicar una renovación fallida. */
+        /* An expired certificate does not prevent encryption, because the
+         * client does not verify it, but it usually signals a failed renewal. */
+        $aInfoCert = @openssl_x509_parse($rCertTLS);
+        if (is_array($aInfoCert) && isset($aInfoCert['validTo_time_t'])
+            && $aInfoCert['validTo_time_t'] < time()) {
+            $this->_log->output(
+                "WARN: el certificado TLS de ECCP está vencido ($sCertTLS)".
+                ' - se sigue cifrando, pero conviene renovarlo'.
+                " | EN: WARN: the ECCP TLS certificate is expired ($sCertTLS)".
+                ' - traffic is still encrypted, but it should be renewed');
+        }
+
+        $rContextoSSL = stream_context_create(array('ssl' => array(
+            'local_cert'            =>  $sCertTLS,
+            'local_pk'              =>  $sClaveTLS,
+            'verify_peer'           =>  FALSE,
+            'verify_peer_name'      =>  FALSE,
+            'allow_self_signed'     =>  TRUE,
+            'disable_compression'   =>  TRUE,
+            'ciphers'               =>  'HIGH:!aNULL:!eNULL:!MD5:!RC4:!3DES:!EXPORT',
+        )));
+
+        $this->_multiplex = new ECCPServer('tcp://0.0.0.0:20005', $this->_log,
+            $this->_tuberia, $rContextoSSL);
         $this->_tuberia->registrarMultiplexHijo($this->_multiplex);
         $this->_tuberia->setLog($this->_log);
 

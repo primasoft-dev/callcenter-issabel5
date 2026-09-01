@@ -485,6 +485,27 @@ SQL_UPDATE_CAMPAIGN;
 
     function delete_campaign($idCampaign)
     {
+        // La campaña debe existir y no estar Activa para poder borrarla: una
+        // campaña Activa puede tener llamadas en curso coordinadas con el
+        // dialer, y borrarla en caliente genera acciones envenenadas en la
+        // cola del SQLWorkerProcess (ver TODO: Campaign Deletion Not
+        // Coordinated With Dialer).
+        // EN: The campaign must exist and not be Active to be deletable: an
+        // Active campaign may have in-flight calls coordinated with the
+        // dialer, and deleting it hot generates poisoned actions in the
+        // SQLWorkerProcess queue (see TODO: Campaign Deletion Not
+        // Coordinated With Dialer).
+        $tupla = $this->_DB->getFirstRowQuery(
+            'SELECT estatus FROM campaign WHERE id = ?', TRUE, array($idCampaign));
+        if (!is_array($tupla) || count($tupla) == 0) {
+            $this->errMsg = _tr('Campaign not found');
+            return FALSE;
+        }
+        if ($tupla['estatus'] == 'A') {
+            $this->errMsg = _tr('Campaign must be inactive or finished to delete it');
+            return FALSE;
+        }
+
         $listaSQL = array(
             'DELETE FROM campaign_form WHERE id_campaign = ?',
             'DELETE FROM call_recording WHERE id_call_outgoing IN (SELECT id from calls WHERE id_campaign = ?)',
@@ -501,6 +522,62 @@ SQL_UPDATE_CAMPAIGN;
         	$r = $this->_DB->genQuery($sql, array($idCampaign));
             if (!$r) {
             	$this->errMsg = $this->_DB->errMsg;
+                $this->_DB->rollBack();
+                return FALSE;
+            }
+        }
+        $this->_DB->commit();
+        return TRUE;
+    }
+
+    /* Procedimiento para purgar las llamadas pendientes (nunca originadas)
+     * de una campaña inactiva, sin borrar la campaña en sí.
+     * EN: Procedure to purge the pending (never-originated) calls of an
+     * inactive campaign, without deleting the campaign itself.
+     *
+     * Solo se purgan las llamadas con status IS NULL: una llamada con estado
+     * NULL jamás ha sido originada (al originar, CampaignProcess la marca
+     * 'Placing' primero, y ningún código revierte una llamada originada a
+     * NULL), por lo que no existen registros en call_progress_log,
+     * call_recording, form_data_recolected ni current_calls para ella. El
+     * único hijo con filas es call_attribute, escrito al cargar los contactos.
+     * EN: Only status IS NULL calls are purged: a NULL-status call has never
+     * been originated (upon originating, CampaignProcess marks it 'Placing'
+     * first, and no code path reverts an originated call back to NULL), so
+     * there are no rows for it in call_progress_log, call_recording,
+     * form_data_recolected or current_calls. The only child table with rows
+     * is call_attribute, written at contact-load time.
+     */
+    function purge_pending_calls($idCampaign)
+    {
+        // La campaña debe existir y estar inactiva para poder purgar
+        // EN: The campaign must exist and be inactive to allow purging
+        $tupla = $this->_DB->getFirstRowQuery(
+            'SELECT estatus FROM campaign WHERE id = ?', TRUE, array($idCampaign));
+        if (!is_array($tupla) || count($tupla) == 0) {
+            $this->errMsg = _tr('Campaign not found');
+            return FALSE;
+        }
+        if ($tupla['estatus'] != 'I') {
+            $this->errMsg = _tr('Campaign must be inactive to purge pending calls');
+            return FALSE;
+        }
+
+        // Borrar primero call_attribute: su clave foránea no tiene ON DELETE
+        // CASCADE, y sin esto el DELETE de calls fallaría con error 1451.
+        // EN: Delete call_attribute first: its foreign key has no ON DELETE
+        // CASCADE, and without this the calls DELETE would fail with error 1451.
+        $listaSQL = array(
+            'DELETE FROM call_attribute WHERE id_call IN '
+                .'(SELECT id FROM calls WHERE id_campaign = ? AND status IS NULL)',
+            'DELETE FROM calls WHERE id_campaign = ? AND status IS NULL',
+        );
+
+        $this->_DB->beginTransaction();
+        foreach ($listaSQL as $sql) {
+            $r = $this->_DB->genQuery($sql, array($idCampaign));
+            if (!$r) {
+                $this->errMsg = $this->_DB->errMsg;
                 $this->_DB->rollBack();
                 return FALSE;
             }

@@ -573,6 +573,9 @@ class PaloSantoConsola
                 if (!is_null($estado['pauseinfo'][$k]) && preg_match('/^\d+:\d+:\d+$/', $estado['pauseinfo'][$k]))
                     $estado['pauseinfo'][$k] = date('Y-m-d ').$estado['pauseinfo'][$k];
             }
+            // The dialer strips today's date from holdstart, same as pausestart
+            if (!is_null($estado['holdstart']) && preg_match('/^\d+:\d+:\d+$/', $estado['holdstart']))
+                $estado['holdstart'] = date('Y-m-d ').$estado['holdstart'];
             if (!is_null($estado['callinfo'])) foreach (array('dialstart', 'dialend', 'queuestart', 'linkstart') as $k) {
                 if (!is_null($estado['callinfo'][$k]) && preg_match('/^\d+:\d+:\d+$/', $estado['callinfo'][$k]))
                     $estado['callinfo'][$k] = date('Y-m-d ').$estado['callinfo'][$k];
@@ -599,6 +602,13 @@ class PaloSantoConsola
             'channel'           =>  isset($connStatus->channel) ? (string)$connStatus->channel : NULL,
             'extension'         =>  isset($connStatus->extension) ? (string)$connStatus->extension : NULL,
             'onhold'            =>  isset($connStatus->onhold) ? ($connStatus->onhold == 1) : FALSE,
+            // Start of the running hold, so the status bar's hold timer can be
+            // restored on a page reload instead of restarting from zero.
+            'holdstart'         =>  isset($connStatus->holdstart) ? (string)$connStatus->holdstart : NULL,
+            // Attended-transfer consultation state: none/ringing/answered.
+            'consultation'      =>  isset($connStatus->consultation) ? (string)$connStatus->consultation : 'none',
+            // DIALSTATUS of the last failed consultation (BUSY/NOANSWER/...).
+            'consultation_reason' => isset($connStatus->consultation_reason) ? (string)$connStatus->consultation_reason : NULL,
             'callchannel'       =>  isset($connStatus->callchannel) ? (string)$connStatus->callchannel : NULL, // <-- duplicado en remote_channel // EN: duplicated in remote_channel
             'pauseinfo'         =>  isset($connStatus->pauseinfo) ? array(
                 'pauseid'       =>  (int)$connStatus->pauseinfo->pauseid,
@@ -1210,7 +1220,12 @@ class PaloSantoConsola
                         $evento[$k] = isset($evt->$k) ? (int) $evt->$k : NULL;
                     break;
                 case 'consultationstart':
+                case 'consultationanswered':
+                    break;
                 case 'consultationend':
+                    // DIALSTATUS of the failed consult (BUSY/NOANSWER/...) if
+                    // the dialer supplied one, NULL otherwise.
+                    $evento['reason'] = isset($evt->reason) ? (string)$evt->reason : NULL;
                     break;
                 }
                 $listaEventos[] = $evento;

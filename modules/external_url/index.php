@@ -75,9 +75,14 @@ function _moduleContent(&$smarty, $module_name)
 function descOpenType()
 {
 	return array(
-        'window'    =>  _tr('New window'),
-        'iframe'    =>  _tr('Embedded frame'),
-        'jsonp'     =>  _tr('JSONP'),
+        'window'         =>  _tr('New window'),
+        'popup'          =>  _tr('Auto popup'),
+        'iframe'         =>  _tr('Embedded frame'),
+        'jsonp'          =>  _tr('JSONP'),
+        'window_hangup'  =>  _tr('New window (on hangup)'),
+        'popup_hangup'   =>  _tr('Auto popup (on hangup)'),
+        'iframe_hangup'  =>  _tr('Embedded frame (on hangup)'),
+        'jsonp_hangup'   =>  _tr('JSONP (on hangup)'),
     );
 }
 

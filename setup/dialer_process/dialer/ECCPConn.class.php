@@ -217,6 +217,44 @@ class ECCPConn
 
         $s = $response->asXML();
 
+        if ($s === FALSE) {
+            /* asXML() devuelve FALSE cuando libxml no puede serializar el arbol,
+             * por ejemplo si un caracter ilegal en XML 1.0 se colo en algun valor.
+             * Sin este respaldo el FALSE se concatena como cadena vacia en
+             * MultiplexServer::encolarDatosEscribir(), no se escribe nada al
+             * socket, y el cliente queda esperando una respuesta que nunca llega:
+             * reintenta, reconecta, y cada peticion simultanea toma un
+             * ECCPWorkerProcess nuevo con su propia conexion PDO, hasta agotar
+             * max_connections. Siempre hay que devolver algo bien formado. */
+            /* asXML() returns FALSE when libxml cannot serialize the tree, for
+             * example if a character illegal in XML 1.0 slipped into some value.
+             * Without this fallback the FALSE is concatenated as an empty string
+             * in MultiplexServer::encolarDatosEscribir(), nothing is written to
+             * the socket, and the client waits for a response that never arrives:
+             * it retries, reconnects, and every simultaneous request takes a fresh
+             * ECCPWorkerProcess with its own PDO connection, until max_connections
+             * is exhausted. Something well-formed must always be returned. */
+            $sNombrePeticion = (isset($comando) && !is_null($comando))
+                ? $comando->getName() : 'desconocida/unknown';
+            $this->_log->output('ERR: '.__METHOD__.': no se puede serializar a XML la'.
+                ' respuesta a la peticion '.$sNombrePeticion.', se responde fallo generico.'.
+                ' | EN: ERR: '.__METHOD__.': cannot serialize the response to request '.
+                $sNombrePeticion.' as XML, replying with a generic failure.');
+
+            $xFallo = $this->_generarRespuestaFallo(500,
+                'Internal server error - response could not be serialized',
+                isset($request['id']) ? (string)$request['id'] : NULL);
+            $s = $xFallo->asXML();
+
+            // Ultimo recurso: XML fijo, sin ningun dato variable que pueda fallar.
+            // Last resort: fixed XML, with no variable data that could fail.
+            if ($s === FALSE) {
+                $s = '<?xml version="1.0"?>'."\n".
+                     '<response><failure><code>500</code>'.
+                     '<message>Internal server error</message></failure></response>'."\n";
+            }
+        }
+
         return array($s, $nuevos_valores, $eventos);
     }
 
@@ -249,7 +287,7 @@ class ECCPConn
     {
         $failureTag = $x->addChild("failure");
         $failureTag->addChild("code", $iCodigo);
-        $failureTag->addChild("message", str_replace('&', '&amp;', $sMensaje));
+        $failureTag->addChild("message", xmlSafe($sMensaje));
     }
 
     private function _parseAgent($sAgente)
@@ -334,14 +372,13 @@ class ECCPConn
         $xml_response = new SimpleXMLElement('<response />');
         $xml_loginResponse = $xml_response->addChild('login_response');
 
-        /* FIXME: No me queda claro de qué manera es más seguro mandar el hash
-         * del password, que el password en texto plano, en una conexión sin
-         * encriptar, ya que en ambos casos se puede recoger con un sniffer.
-         * Por ahora se acepta el password con o sin hash.
-         * FIXME: It's not clear to me in what way it's more secure to send the
-         * password hash than the plaintext password on an unencrypted connection,
-         * since in both cases it can be captured with a sniffer. For now,
-         * password is accepted with or without hash. */
+        /* La conexión ECCP va cifrada con TLS (ver ECCPProcess), así que la
+         * clave ya no puede recogerse con un sniffer. Se sigue aceptando con o
+         * sin hash md5 por compatibilidad con los clientes existentes.
+         * The ECCP connection is TLS encrypted (see ECCPProcess), so the
+         * password can no longer be captured with a sniffer. It is still
+         * accepted with or without md5 hash for compatibility with existing
+         * clients. */
         /* TODO: se puede almacenar cuál agente(s) está autorizado a atender en
          * la tabla eccp_authorized_clients
          * TODO: can store which agent(s) is authorized to attend in the
@@ -461,7 +498,7 @@ class ECCPConn
             $this->_agregarRespuestaFallo($xml_GetQueueScriptResponse, 404, 'Queue not found in incoming queues');
             return $xml_response;
         }
-        $xml_GetQueueScriptResponse->addChild('script', str_replace('&', '&amp;', $tupla['script']));
+        $xml_GetQueueScriptResponse->addChild('script', xmlSafe($tupla['script']));
         return $xml_response;
     }
 
@@ -599,7 +636,7 @@ class ECCPConn
             $xml_campaign = $xml_campaigns->addChild('campaign');
             $xml_campaign->addChild('id', $tupla['id']);
             $xml_campaign->addChild('type', $tupla['campaign_type']);
-            $xml_campaign->addChild('name', str_replace('&', '&amp;', $tupla['name']));
+            $xml_campaign->addChild('name', xmlSafe($tupla['name']));
             $xml_campaign->addChild('status', $descEstados[$tupla['status']]);
         }
 
@@ -905,11 +942,11 @@ class ECCPConn
                  * with HTML entities to the database. For compatibility with
                  * old campaigns, HTML encoding is undone here. */
                 $sValor = html_entity_decode($sValor, ENT_COMPAT, 'UTF-8');
-                $xml_GetCampaignInfoResponse->addChild($sKey, str_replace('&', '&amp;', $sValor));
+                $xml_GetCampaignInfoResponse->addChild($sKey, xmlSafe($sValor));
                 break;
             case 'status':
                 $sValor = $descEstados[$sValor];
-                $xml_GetCampaignInfoResponse->addChild($sKey, str_replace('&', '&amp;', $sValor));
+                $xml_GetCampaignInfoResponse->addChild($sKey, xmlSafe($sValor));
                 break;
             case 'trunk':   // Sólo para campañas salientes
                                 // Only for outgoing campaigns
@@ -917,7 +954,7 @@ class ECCPConn
                 // Pass to default case if value is not null
                 if (is_null($sValor)) break;
             default:
-                $xml_GetCampaignInfoResponse->addChild($sKey, str_replace('&', '&amp;', $sValor));
+                $xml_GetCampaignInfoResponse->addChild($sKey, xmlSafe($sValor));
                 break;
             }
         }
@@ -984,8 +1021,8 @@ class ECCPConn
             $xml_Field = $xml_Form->addChild('field');
             $xml_Field->addAttribute('order', $tuplaCampo['order']);
             $xml_Field->addAttribute('id', $tuplaCampo['id']);
-            $xml_Field->addChild('label', str_replace('&', '&amp;', $tuplaCampo['label']));
-            $xml_Field->addChild('type', str_replace('&', '&amp;', $tuplaCampo['type']));
+            $xml_Field->addChild('label', xmlSafe($tuplaCampo['label']));
+            $xml_Field->addChild('type', xmlSafe($tuplaCampo['type']));
 
             // TODO: permitir especificar longitud de la entrada
             // TODO: allow specifying input length
@@ -1005,7 +1042,7 @@ class ECCPConn
                 }
                 $xml_Values = $xml_Field->addChild('options');
                 foreach (explode(',', $tuplaCampo['value']) as $sValor) {
-                    $xml_Values->addChild('value', str_replace('&', '&amp;', $sValor));
+                    $xml_Values->addChild('value', xmlSafe($sValor));
                 }
             } else {
                 // Usar el valor 'value' como valor por omisión.
@@ -1017,7 +1054,7 @@ class ECCPConn
                 // implemented in agent_console or in web interface form definition
                 $sDefVal = trim($tuplaCampo['value']);
                 if ($sDefVal != '')
-                    $xml_Field->addChild('default_value', str_replace('&', '&amp;', $sDefVal));
+                    $xml_Field->addChild('default_value', xmlSafe($sDefVal));
             }
         }
     }
@@ -1076,9 +1113,9 @@ class ECCPConn
                 $xml_callAttrlist = $xml_GetCallInfoResponse->addChild($sKey);
                 foreach ($valor as $tuplaAttr) {
                     $xml_callAttr = $xml_callAttrlist->addChild('attribute');
-                    $xml_callAttr->addChild('label', str_replace('&', '&amp;', $tuplaAttr['label']));
-                    $xml_callAttr->addChild('value', str_replace('&', '&amp;', $tuplaAttr['value']));
-                    $xml_callAttr->addChild('order', str_replace('&', '&amp;', $tuplaAttr['order']));
+                    $xml_callAttr->addChild('label', xmlSafe($tuplaAttr['label']));
+                    $xml_callAttr->addChild('value', xmlSafe($tuplaAttr['value']));
+                    $xml_callAttr->addChild('order', xmlSafe($tuplaAttr['order']));
                 }
                 break;
             case 'matching_contacts':
@@ -1088,9 +1125,9 @@ class ECCPConn
                     $xml_callAttrlist->addAttribute('id', $id_contact);
                     foreach ($tuplaContact as $tuplaAttr) {
                         $xml_callAttr = $xml_callAttrlist->addChild('attribute');
-                        $xml_callAttr->addChild('label', str_replace('&', '&amp;', $tuplaAttr['label']));
-                        $xml_callAttr->addChild('value', str_replace('&', '&amp;', $tuplaAttr['value']));
-                        $xml_callAttr->addChild('order', str_replace('&', '&amp;', $tuplaAttr['order']));
+                        $xml_callAttr->addChild('label', xmlSafe($tuplaAttr['label']));
+                        $xml_callAttr->addChild('value', xmlSafe($tuplaAttr['value']));
+                        $xml_callAttr->addChild('order', xmlSafe($tuplaAttr['order']));
                     }
                 }
                 break;
@@ -1102,13 +1139,13 @@ class ECCPConn
                     foreach ($valoresForm as $tuplaValor) {
                         $xml_callFormField = $xml_callForm->addChild('field');
                         $xml_callFormField->addAttribute('id', $tuplaValor['id']);
-                        $xml_callFormField->addChild('label', str_replace('&', '&amp;', $tuplaValor['label']));
-                        $xml_callFormField->addChild('value', str_replace('&', '&amp;', $tuplaValor['value']));
+                        $xml_callFormField->addChild('label', xmlSafe($tuplaValor['label']));
+                        $xml_callFormField->addChild('value', xmlSafe($tuplaValor['value']));
                     }
                 }
                 break;
             default:
-                if (!is_null($valor)) $xml_GetCallInfoResponse->addChild($sKey, str_replace('&', '&amp;', $valor));
+                if (!is_null($valor)) $xml_GetCallInfoResponse->addChild($sKey, xmlSafe($valor));
                 break;
             }
         }
@@ -1361,10 +1398,10 @@ class ECCPConn
         foreach ($recordset as $tupla) {
             $xml_pause = $xml_getPausesResponse->addChild('pause');
             $xml_pause->addAttribute('id', $tupla['id']);
-            $xml_pause->addChild('name', str_replace('&', '&amp;', $tupla['name']));
-            $xml_pause->addChild('status', str_replace('&', '&amp;', $tupla['status']));
-            $xml_pause->addChild('type', str_replace('&', '&amp;', $tupla['tipo']));
-            $xml_pause->addChild('description', str_replace('&', '&amp;', $tupla['description']));
+            $xml_pause->addChild('name', xmlSafe($tupla['name']));
+            $xml_pause->addChild('status', xmlSafe($tupla['status']));
+            $xml_pause->addChild('type', xmlSafe($tupla['tipo']));
+            $xml_pause->addChild('description', xmlSafe($tupla['description']));
         }
 
         return $xml_response;
@@ -1539,7 +1576,7 @@ class ECCPConn
             return NULL;
         }
         try {
-            $dbConn = new PDO("mysql:host={$dbParams['AMPDBHOST']};dbname=asterisk",
+            $dbConn = new PDO("mysql:host={$dbParams['AMPDBHOST']};dbname=asterisk;charset=utf8mb4",
                 $dbParams['AMPDBUSER'], $dbParams['AMPDBPASS']);
             $dbConn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
             $dbConn->setAttribute(PDO::ATTR_EMULATE_PREPARES, FALSE);
@@ -2079,7 +2116,7 @@ class ECCPConn
         $xml_agents = $xml_getAgentStatusResponse->addChild('agents');
         foreach ($agentlist as $sAgente) {
             $xml_agent = $xml_agents->addChild('agent');
-            $xml_agent->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+            $xml_agent->addChild('agent_number', xmlSafe($sAgente));
 
             $infoSeguimiento = $is[$sAgente];
             $infoLlamada = $il[$sAgente];
@@ -2095,6 +2132,16 @@ class ECCPConn
     private function _agregarAgentStatusInfo($xml_agent, &$infoSeguimiento,
         &$infoLlamada)
     {
+        // Attended-transfer consultation state (none/ringing/answered) so the
+        // console can reconcile a missed Consultation* event on its next poll.
+        $xml_agent->addChild('consultation', isset($infoSeguimiento['consultation'])
+            ? $infoSeguimiento['consultation'] : 'none');
+        // DIALSTATUS of the last consultation that failed, so the console can
+        // still tell the agent why even if the ConsultationEnd event was lost.
+        if (!empty($infoSeguimiento['consultation_reason'])) {
+            $xml_agent->addChild('consultation_reason', $infoSeguimiento['consultation_reason']);
+        }
+
         list($sAgentStatus, $sExtension) = self::getcampaignstatus_setagent(
             $xml_agent, $infoSeguimiento, FALSE, $infoLlamada);
 
@@ -2277,11 +2324,53 @@ class ECCPConn
                         $isInConsultation = $this->_tuberia->AMIEventProcess_esAgenteEnConsultation($sAgente);
 
                         if ($isInConsultation) {
+                            // Consultation is still active (Dial() to the colleague hasn't
+                            // ended). Distinguish "still ringing / never engaged" (Hangup
+                            // means cancel) from "colleague has answered" (Hangup now
+                            // means complete, per the ConsultationAnswered UserEvent).
+                            $consultaContestada = $this->_tuberia->AMIEventProcess_infoConsultaContestada($sAgente);
+
+                            if (!is_null($consultaContestada) && !empty($consultaContestada['channel'])) {
+                                // ================================================================
+                                // COMPLETE TRANSFER (colleague answered, agent hangs up while
+                                // talking to them): dual-Redirect, mirroring the technique that
+                                // started the consultation - move the colleague's channel into
+                                // atxfer-bridge (to bridge with the held customer) and the
+                                // agent's login_channel into atxfer-complete (to re-enter
+                                // AgentLogin), simultaneously. The customer is NOT hung up here -
+                                // they end up bridged with the colleague instead.
+                                // ================================================================
+                                $this->_log->output('DEBUG: ========== COMPLETAR TRANSFERENCIA (consulta contestada) | EN: COMPLETE TRANSFER (consultation answered) ==========');
+                                $this->_log->output('DEBUG: Agente/Agent: '.$sAgente.', Destino/Target: '.$transferDest.', login_channel: '.$loginChannel.', colleague_channel: '.$consultaContestada['channel']);
+
+                                $r = $this->_ami->Redirect(
+                                    $loginChannel,                  // Channel: agent's login_channel
+                                    $consultaContestada['channel'], // ExtraChannel: the colleague's real channel
+                                    $agentNumber,                   // Exten: agent number
+                                    'atxfer-complete',              // Context: re-enter AgentLogin
+                                    1,                              // Priority
+                                    's',                            // ExtraExten
+                                    'atxfer-bridge',                // ExtraContext: bridge colleague with held customer
+                                    1                               // ExtraPriority
+                                );
+                                $this->_log->output('DEBUG: Resultado de Redirect/Redirect result: '.print_r($r, true));
+
+                                if ($r['Response'] == 'Success') {
+                                    $this->_log->output('INFO: Transferencia completada (consulta contestada) - agente redirigido a atxfer-complete, colega a atxfer-bridge | EN: Transfer completed (consultation answered) - agent redirected to atxfer-complete, colleague to atxfer-bridge');
+                                    $this->_tuberia->msg_AMIEventProcess_finalizarTransferencia($sAgente);
+                                    $xml_hangupResponse->addChild('success');
+                                    return $xml_response;
+                                } else {
+                                    $this->_log->output('WARN: Redirect falló: '.$r['Message'].', usando hangup normal | EN: Redirect failed: '.$r['Message'].', falling back to normal hangup');
+                                    $hangchannel = $infoLlamada['actualchannel'];
+                                }
+                            } else {
                             // ================================================================
-                            // CANCEL CONSULTATION: Agent is actively consulting (Dial in
-                            // progress). Redirect to atxfer-cancel-consult which terminates
-                            // the consulting call and Bridge()s the agent back to the
-                            // customer. Call tracking is preserved (no _finalizarTransferencia).
+                            // CANCEL CONSULTATION: Agent is actively consulting but the
+                            // colleague has not answered yet. Redirect to atxfer-cancel-consult
+                            // which terminates the consulting call and Bridge()s the agent
+                            // back to the customer. Call tracking is preserved (no
+                            // _finalizarTransferencia).
                             // ================================================================
                             $this->_log->output('DEBUG: ========== CANCELAR CONSULTA | EN: CANCEL CONSULTATION ==========');
                             $this->_log->output('DEBUG: Agente/Agent: '.$sAgente.', Destino/Target: '.$transferDest.', login_channel: '.$loginChannel);
@@ -2309,6 +2398,7 @@ class ECCPConn
                             } else {
                                 $this->_log->output('WARN: Redirect falló: '.$r['Message'].', usando hangup normal | EN: Redirect failed: '.$r['Message'].', falling back to normal hangup');
                                 $hangchannel = $infoLlamada['actualchannel'];
+                            }
                             }
                         } else {
                             // ================================================================
@@ -2369,40 +2459,86 @@ class ECCPConn
 
                 if ($isAttendedTransfer) {
                     // ========================================================================
-                    // CALLBACK AGENT ATTENDED TRANSFER COMPLETION
-                    // For callback agents, during attended transfer hangup we need to
-                    // hang up the agent's channel (not the customer's) to complete
-                    // the transfer and connect customer to colleague.
+                    // CALLBACK AGENT ATTENDED TRANSFER
+                    // Mirrors the Agent-type split above: while the colleague is
+                    // still ringing, Hangup means CANCEL (reconnect the agent to
+                    // the customer); once the colleague has answered it means
+                    // COMPLETE (bridge colleague and customer, release the agent).
+                    // The old code made no such distinction and always hung up
+                    // the agent's original channel, which dropped the customer
+                    // whenever the transfer was cancelled while ringing.
                     // ========================================================================
-                    $this->_log->output('DEBUG: ========== INICIO DE TRANSFERENCIA ATENDIDA AGENTE CALLBACK | EN: CALLBACK AGENT ATTENDED TRANSFER COMPLETION START ==========');
+                    $this->_log->output('DEBUG: ========== INICIO DE TRANSFERENCIA ATENDIDA AGENTE CALLBACK | EN: CALLBACK AGENT ATTENDED TRANSFER START ==========');
                     $this->_log->output('DEBUG: Agente/Agent: '.$sAgente.', Destino de transferencia/Transfer Target: '.$transferDest);
 
-                    // Use agentchannel for callback agents to complete the transfer
-                    // If agentchannel doesn't have unique ID (no hyphen), get the actual agent channel
-                    if (strpos($hangchannel, '-') === false) {
-                        // agentchannel is just "SIP/101" - need to find the actual channel with unique ID
-                        // Try using actualAgentChannel if available
-                        if (isset($infoLlamada['actualAgentChannel']) && !empty($infoLlamada['actualAgentChannel'])) {
-                            $hangchannel = $infoLlamada['actualAgentChannel'];
-                            $this->_log->output('DEBUG: Usando actualAgentChannel | EN: Using actualAgentChannel: '.$hangchannel);
-                        } else {
-                            // Fallback: try to construct the channel from current agent info
-                            $infoAgente = $this->_tuberia->AMIEventProcess_infoSeguimientoAgente($sAgente);
-                            if (!is_null($infoAgente) && !empty($infoAgente['channel']) && strpos($infoAgente['channel'], '-') !== false) {
-                                $hangchannel = $infoAgente['channel'];
-                                $this->_log->output('DEBUG: Usando canal del agente de infoSeguimiento | EN: Using agent channel from infoSeguimiento: '.$hangchannel);
-                            } else {
-                                // Last resort: use the agentchannel as-is and hope Asterisk can match it
-                                $this->_log->output('DEBUG: Usando agentchannel sin ID único | EN: Using agentchannel without unique ID: '.$hangchannel);
+                    $agentChannel = (isset($infoLlamada['actualAgentChannel'])
+                        && !empty($infoLlamada['actualAgentChannel']))
+                        ? $infoLlamada['actualAgentChannel'] : $hangchannel;
+
+                    $isInConsultation = $this->_tuberia->AMIEventProcess_esAgenteEnConsultation($sAgente);
+                    if ($isInConsultation && strpos($agentChannel, '-') !== FALSE) {
+                        $consultaContestada = $this->_tuberia->AMIEventProcess_infoConsultaContestada($sAgente);
+
+                        if (!is_null($consultaContestada) && !empty($consultaContestada['channel'])) {
+                            // ------------------------------------------------------------
+                            // COMPLETE: the colleague answered. Move both channels at once -
+                            // the colleague into atxfer-bridge, where it bridges with the
+                            // held customer, and the agent into cbxfer-done, which hangs it
+                            // up. The agent channel's Hangup event is what releases the call
+                            // from tracking (_manejarHangupLoginChannelEnConsulta with
+                            // answered=yes); deliberately no finalizarTransferencia here, so
+                            // there is exactly one owner of that release.
+                            // ------------------------------------------------------------
+                            $this->_log->output('INFO: '.__METHOD__.": COMPLETAR TRANSFERENCIA callback $sAgente".
+                                ' colega/colleague='.$consultaContestada['channel'].' agente/agent='.$agentChannel.
+                                ' | EN: COMPLETE callback attended transfer');
+                            $r = $this->_ami->Redirect(
+                                $consultaContestada['channel'],  // Channel: colleague
+                                $agentChannel,                   // ExtraChannel: agent
+                                's', 'atxfer-bridge', 1,         // colleague -> bridge with held customer
+                                's', 'cbxfer-done', 1            // agent -> hang up
+                            );
+                            if ($r['Response'] == 'Success') {
+                                $xml_hangupResponse->addChild('success');
+                                return $xml_response;
                             }
+                            $this->_log->output('ERR: '.__METHOD__.": Redirect to complete callback transfer failed".
+                                ' for '.$sAgente.' - '.$r['Message'].' - falling back to plain hangup');
+                        } else {
+                            // ------------------------------------------------------------
+                            // CANCEL: the colleague is still ringing. Redirect ONLY the
+                            // agent's channel to cbxfer-cancel-consult, which ends the
+                            // Dial(), emits ConsultationEnd and bridges the agent back to
+                            // the held customer. Nothing is hung up - hanging up here is
+                            // exactly what used to disconnect the customer.
+                            // ------------------------------------------------------------
+                            $this->_log->output('INFO: '.__METHOD__.": CANCELAR CONSULTA callback $sAgente".
+                                ' agente/agent='.$agentChannel.' | EN: CANCEL callback consultation');
+                            $r = $this->_ami->Redirect(
+                                $agentChannel, '', 's', 'cbxfer-cancel-consult', 1);
+                            if ($r['Response'] == 'Success') {
+                                $xml_hangupResponse->addChild('success');
+                                return $xml_response;
+                            }
+                            $this->_log->output('ERR: '.__METHOD__.": Redirect to cancel callback consultation failed".
+                                ' for '.$sAgente.' - '.$r['Message'].' - falling back to plain hangup');
                         }
                     }
-                    $this->_log->output('DEBUG: Transferencia atendida agente callback - colgando canal: '.$hangchannel.' | EN: Callback agent attended transfer - hanging up channel: '.$hangchannel);
 
-                    // Release agent from call tracking
-                    $this->_tuberia->msg_AMIEventProcess_finalizarTransferencia($sAgente);
-
-                    $this->_log->output('INFO: Transferencia atendida de agente callback completada - se colgará canal del agente | EN: Callback agent attended transfer completion - will hangup agent channel');
+                    /* No hay consulta activa: la columna `transfer` quedó
+                     * marcada de un intento anterior. Con la limpieza que hace
+                     * ahora ConsultationEnd esto no debería ocurrir; se
+                     * conserva como red de seguridad y se cuelga al cliente,
+                     * que es el comportamiento normal de un hangup. */
+                    /* EN: No live consultation: the `transfer` column is left
+                     * over from an earlier attempt. With the cleanup
+                     * ConsultationEnd now performs this should not happen; kept
+                     * as a safety net, hanging up the customer, which is what a
+                     * plain hangup does. */
+                    $this->_log->output('WARN: '.__METHOD__.": callback agent $sAgente has transfer=$transferDest".
+                        ' but no live consultation - treating as a normal hangup'.
+                        " | ES: el agente callback $sAgente tiene transfer marcado pero no hay consulta activa");
+                    $hangchannel = $infoLlamada['actualchannel'];
                 } elseif (strpos($hangchannel, '-') === false) {
                     // No attended transfer - normal hangup, use actualchannel
                     $hangchannel = $infoLlamada['actualchannel'];
@@ -2602,7 +2738,7 @@ class ECCPConn
         }
         if (!is_null($sAgentStatus)) {
             $xml_agent->addChild('status', $sAgentStatus);
-            if (!is_null($sCanalExt)) $xml_agent->addChild('channel', str_replace('&', '&amp;', $sCanalExt));
+            if (!is_null($sCanalExt)) $xml_agent->addChild('channel', xmlSafe($sCanalExt));
             if (!is_null($sExtension)) $xml_agent->addChild('extension', $sExtension);
         }
 
@@ -2613,7 +2749,7 @@ class ECCPConn
              * Agente::resumenSeguimiento().
              */
             $xml_agent->addChild(($flattened ? 'callchannel' : 'remote_channel'),
-                str_replace('&', '&amp;', $infoAgente['clientchannel']));
+                xmlSafe($infoAgente['clientchannel']));
         }
 
         // Reportar la información de la llamada que el agente está esperando, si aplica
@@ -2624,15 +2760,25 @@ class ECCPConn
         }
 
         // Reportar el estado de hold, si aplica
-        if ($infoAgente['estado_consola'] == 'logged-in')
+        if ($infoAgente['estado_consola'] == 'logged-in') {
             $xml_agent->addChild('onhold', is_null($infoAgente['id_hold']) ? 0 : 1);
+            // Inicio del hold en curso, cargado por cargarInfoPausa() desde la
+            // fila de audit. Sin esto la consola sabe que el agente está en
+            // hold pero no desde cuándo, y el cronómetro no sobrevive a un F5.
+            // EN: start of the running hold, loaded by cargarInfoPausa() from
+            // the audit row. Without it the console knows the agent is on hold
+            // but not since when, and the timer cannot survive a refresh.
+            if (isset($infoAgente['holdstart']))
+                $xml_agent->addChild('holdstart',
+                    str_replace(date('Y-m-d '), '', $infoAgente['holdstart']));
+        }
 
         // Reportar los estados de break, si aplica
         if (!is_null($infoAgente['id_break'])) {
             $xml_pauseInfo = $flattened ? $xml_agent : $xml_agent->addChild('pauseinfo');
             $xml_pauseInfo->addChild('pauseid', $infoAgente['id_break']);
             if (isset($infoAgente['pausename']))
-                $xml_pauseInfo->addChild('pausename', str_replace('&', '&amp;', $infoAgente['pausename']));
+                $xml_pauseInfo->addChild('pausename', xmlSafe($infoAgente['pausename']));
             if (isset($infoAgente['pausestart']))
                 $xml_pauseInfo->addChild('pausestart', str_replace(date('Y-m-d '), '', $infoAgente['pausestart']));
         }
@@ -3306,8 +3452,10 @@ SQL_INSERTAR_AGENDAMIENTO;
             // Uses synchronous RPC to ensure the flag is set before Redirect fires.
             $this->_tuberia->AMIEventProcess_prepararAtxferComplete($sAgente);
 
-            // Mark agent as in consultation so ConsultationEnd can be detected
-            $this->_tuberia->msg_AMIEventProcess_marcarConsultationIniciada($sAgente);
+            // Mark agent as in consultation so ConsultationEnd can be detected.
+            // The request timestamp lets AMIEventProcess discard this mark if a
+            // ConsultationEnd for the same consultation got there first.
+            $this->_tuberia->msg_AMIEventProcess_marcarConsultationIniciada($sAgente, microtime(TRUE));
 
             // Redirect both channels simultaneously:
             // - Agent's SIP phone -> atxfer-consult (dials the target)
@@ -3322,9 +3470,83 @@ SQL_INSERTAR_AGENDAMIENTO;
                 'atxfer-hold',         // ExtraContext: caller MOH context
                 1                              // ExtraPriority
             );
+        } elseif (strpos($sAgente, 'Agent/') !== 0
+                && !is_null($this->_compat) && $this->_compat->hasAppAgentPool()) {
+            /* Agente tipo callback (SIP/IAX2/PJSIP) en Asterisk 12+. Se usa el
+             * mismo flujo basado en Redirect que el tipo Agent, en sus propios
+             * contextos [cbxfer-*], en lugar del Atxfer nativo: éste no
+             * distingue "sonando" de "contestada", no expone ${DIALSTATUS} y
+             * no ofrece una cancelación utilizable, que es justo de donde
+             * venían los fallos de esta ruta. */
+            /* EN: Callback-type agent (SIP/IAX2/PJSIP) on Asterisk 12+. Uses
+             * the same Redirect-based flow as the Agent type, in its own
+             * [cbxfer-*] contexts, instead of native Atxfer: that gives no
+             * ringing/answered distinction, no ${DIALSTATUS} and no usable
+             * cancel, which is exactly where this path's defects came from. */
+            $transferChannel = isset($infoLlamada['actualAgentChannel'])
+                ? $infoLlamada['actualAgentChannel']
+                : $infoLlamada['agentchannel'];
+            $this->_log->output('DEBUG: '.__METHOD__.': callback agent, using channel: '.$transferChannel);
+
+            if (empty($transferChannel) || strpos($transferChannel, '-') === FALSE) {
+                // Bare device name (e.g. "SIP/1002") - Asterisk cannot Redirect that.
+                $this->_log->output('ERR: '.__METHOD__.': callback agent '.$sAgente.
+                    ' has no usable channel ('.var_export($transferChannel, TRUE).')');
+                $this->_agregarRespuestaFallo($xml_transferResponse, 500, 'No agent channel found');
+                return $xml_response;
+            }
+
+            $clientChannel = $infoLlamada['actualchannel'];
+            if (empty($clientChannel)) {
+                $this->_log->output('ERR: '.__METHOD__.': No actualchannel found for the call');
+                $this->_agregarRespuestaFallo($xml_transferResponse, 500, 'No caller channel found');
+                return $xml_response;
+            }
+
+            /* Comprobar disponibilidad ANTES de mover ningún canal: si el
+             * colega está ocupado sin llamada en espera, o en No Molestar, se
+             * rechaza aquí y no se llega a marcar nada ni a tocar el estado de
+             * consulta. [cbxfer-consult] marca el dispositivo directamente
+             * (para evitar el tono de ocupado de 20 s de from-internal), así
+             * que sin esta comprobación la consulta se forzaría igualmente. */
+            /* EN: Check availability BEFORE moving any channel: if the
+             * colleague is busy with no call waiting, or on Do Not Disturb,
+             * refuse here - nothing is dialled and no consultation state is
+             * touched. [cbxfer-consult] dials the device directly (to avoid
+             * from-internal's 20-second busy tone), so without this check the
+             * consultation would be forced through regardless. */
+            if (!$this->_verificarColegaDisponible($sExtension, $xml_transferResponse))
+                return $xml_response;
+
+            $this->_log->output('DEBUG: '.__METHOD__.': Client channel (held party): '.$clientChannel);
+
+            // Channel variables read by [cbxfer-consult] / [cbxfer-cancel-consult].
+            // ATXFER_AGENT_ID is the full agent id (e.g. SIP/1002) because the
+            // dialer keys its consultation state on that, not on a bare number.
+            $this->_ami->SetVar($transferChannel, 'ATXFER_HELD_CHAN', $clientChannel);
+            $this->_ami->SetVar($transferChannel, 'ATXFER_AGENT_ID', $sAgente);
+
+            // Mark agent as in consultation so ConsultationEnd can be detected.
+            // The request timestamp lets AMIEventProcess discard this mark if a
+            // ConsultationEnd for the same consultation got there first.
+            $this->_tuberia->msg_AMIEventProcess_marcarConsultationIniciada($sAgente, microtime(TRUE));
+
+            // Redirect both channels simultaneously:
+            // - Agent's device channel -> cbxfer-consult (dials the colleague)
+            // - External caller        -> atxfer-hold (music on hold)
+            $r = $this->_ami->Redirect(
+                $transferChannel,       // Channel: agent's SIP/PJSIP/IAX2 channel
+                $clientChannel,         // ExtraChannel: external caller
+                $sExtension,            // Exten: target extension number
+                'cbxfer-consult',       // Context: callback consultation context
+                1,                      // Priority
+                's',                    // ExtraExten: hold context uses 's'
+                'atxfer-hold',          // ExtraContext: caller MOH context
+                1                       // ExtraPriority
+            );
         } else {
-            // For non-Agent types (SIP/IAX2/PJSIP callback) or Asterisk 11/13,
-            // use Atxfer which works when DTMF hooks are available
+            // For Asterisk 11/13, or an Agent type that somehow has no
+            // login_channel, use Atxfer which works when DTMF hooks are available
             $transferChannel = isset($infoLlamada['actualAgentChannel'])
                 ? $infoLlamada['actualAgentChannel']
                 : $infoLlamada['agentchannel'];
@@ -3336,7 +3558,7 @@ SQL_INSERTAR_AGENDAMIENTO;
             $this->_ami->SetVar($transferChannel, 'TRANSFER_CONTEXT', 'cbext-atxfer');
 
             // Mark agent as in consultation so msg_Link can detect return
-            $this->_tuberia->msg_AMIEventProcess_marcarConsultationIniciada($sAgente);
+            $this->_tuberia->msg_AMIEventProcess_marcarConsultationIniciada($sAgente, microtime(TRUE));
 
             $this->_log->output('DEBUG: '.__METHOD__.': Sending Atxfer to ext='.$sExtension.' context=cbext-atxfer channel='.$transferChannel);
             $r = $this->_ami->Atxfer(
@@ -3631,6 +3853,80 @@ SQL_INSERTAR_AGENDAMIENTO;
         return TRUE;
     }
 
+    /**
+     * Check whether a colleague can take an attended-transfer consultation
+     * right now, for the callback path, which dials the device directly and
+     * therefore bypasses the from-internal/ext-local dialplan where FreePBX
+     * would normally enforce Do Not Disturb and Call Waiting. Without this,
+     * a consultation is forced onto a colleague who is already on a call
+     * regardless of their Call Waiting setting.
+     *
+     * Refuses on Do Not Disturb, and on a busy device whose owner has Call
+     * Waiting disabled. A busy device WITH Call Waiting enabled is allowed
+     * through - that is exactly what Call Waiting means. Fails open on any
+     * AMI error: an unavailable check must never block a transfer.
+     *
+     * Verifica si un colega puede atender ahora una consulta de transferencia
+     * atendida, para la ruta callback, que marca el dispositivo directamente
+     * y por tanto se salta el plan de marcado from-internal/ext-local donde
+     * IssabelPBX aplicaría No Molestar y Llamada en Espera.
+     *
+     * @param string           $sExtension           colleague's extension
+     * @param SimpleXMLElement $xml_transferResponse response to fill on refusal
+     * @return bool TRUE if the consultation may proceed
+     */
+    private function _verificarColegaDisponible($sExtension, $xml_transferResponse)
+    {
+        // Do Not Disturb - FreePBX stores DND/<exten> only while it is on
+        $sDND = $this->_ami->database_get('DND', $sExtension);
+        if ($sDND !== FALSE && trim($sDND) != '') {
+            $this->_log->output('INFO: '.__METHOD__.": colleague $sExtension is on DND (".trim($sDND).
+                ") - refusing consultation | ES: el colega $sExtension está en No Molestar, se rechaza la consulta");
+            $this->_agregarRespuestaFallo($xml_transferResponse, 417,
+                'Colleague has Do Not Disturb enabled | El colega tiene No Molestar activado');
+            return FALSE;
+        }
+
+        $r = $this->_ami->ExtensionState($sExtension, 'from-internal');
+        if (!is_array($r) || !isset($r['Response']) || $r['Response'] != 'Success') {
+            $sMsg = (is_array($r) && isset($r['Message'])) ? $r['Message'] : 'unknown';
+            $this->_log->output('WARN: '.__METHOD__.": ExtensionState query failed for $sExtension: $sMsg".
+                ' - proceeding with consultation (fail-open) | ES: consulta ExtensionState falló, se continúa');
+            return TRUE;
+        }
+
+        // Bitmask: 0=Idle, 1=InUse, 2=Busy, 4=Unavailable, 8=Ringing, 16=OnHold, -1=Not found.
+        // Unavailable is deliberately NOT treated as busy: an unregistered device
+        // should produce a normal CHANUNAVAIL consultation the agent gets told about.
+        $iStatus = (int)$r['Status'];
+        $BUSY_MASK = 1 | 2 | 8 | 16;
+        if ($iStatus <= 0 || !($iStatus & $BUSY_MASK)) {
+            $this->_log->output('DEBUG: '.__METHOD__.": colleague $sExtension available (Status=$iStatus)");
+            return TRUE;
+        }
+
+        // Busy - but Call Waiting turns "busy" into a legitimate second call.
+        $sCW = $this->_ami->database_get('CW', $sExtension);
+        if ($sCW !== FALSE && trim($sCW) != '') {
+            $this->_log->output('INFO: '.__METHOD__.": colleague $sExtension is busy (Status=$iStatus)".
+                ' but has Call Waiting enabled - proceeding'.
+                " | ES: el colega $sExtension está ocupado pero tiene Llamada en Espera, se continúa");
+            return TRUE;
+        }
+
+        $aFlags = array();
+        if ($iStatus & 1)  $aFlags[] = 'InUse';
+        if ($iStatus & 2)  $aFlags[] = 'Busy';
+        if ($iStatus & 8)  $aFlags[] = 'Ringing';
+        if ($iStatus & 16) $aFlags[] = 'OnHold';
+        $this->_log->output('INFO: '.__METHOD__.": colleague $sExtension is busy (Status=$iStatus ".
+            implode('+', $aFlags).') with Call Waiting disabled - refusing consultation'.
+            " | ES: el colega $sExtension está ocupado sin Llamada en Espera, se rechaza la consulta");
+        $this->_agregarRespuestaFallo($xml_transferResponse, 417,
+            'Colleague is busy | El colega está ocupado');
+        return FALSE;
+    }
+
     private function Request_agentauth_hold($comando)
     {
         $sAgente = (string)$comando->agent_number;
@@ -3867,7 +4163,7 @@ SQL_INSERTAR_AGENDAMIENTO;
             // $listaColas[$sAgente][0] son colas suscritas actualmente
             // $listaColas[$sAgente][1] son colas dinámicas a las que puede suscribirse
             foreach (array_unique(array_merge($listaColas[$sAgente][0], $listaColas[$sAgente][1])) as $sCola) {
-                $xml_agentQueues->addChild('queue', str_replace('&', '&amp;', $sCola));
+                $xml_agentQueues->addChild('queue', xmlSafe($sCola));
             }
         }
 
@@ -3924,10 +4220,10 @@ SQL_INSERTAR_AGENDAMIENTO;
         $xml_agents = $xml_getagentqueuesResponse->addChild('agents');
         foreach (array_keys($agentlist) as $sAgente) {
             $xml_agent = $xml_agents->addChild('agent');
-            $xml_agent->addChild('agent_number', str_replace('&', '&amp;', $sAgente));
+            $xml_agent->addChild('agent_number', xmlSafe($sAgente));
             $xml_agentQueues = $xml_agent->addChild('queues');
             foreach ($agentlist[$sAgente]['queues'] as $sCola) {
-                $xml_agentQueues->addChild('queue', str_replace('&', '&amp;', $sCola));
+                $xml_agentQueues->addChild('queue', xmlSafe($sCola));
             }
         }
 
@@ -4051,7 +4347,7 @@ LEER_ULTIMA_SESION;
         foreach ($listaAgentes as $infoAgente) {
         	$xml_agent = $xml_agents->addChild('agent');
             $xml_agent->addChild('agentchannel', $infoAgente['type'].'/'.$infoAgente['number']);
-            $xml_agent->addChild('agentname', str_replace('&', '&amp;', $infoAgente['name']));
+            $xml_agent->addChild('agentname', xmlSafe($infoAgente['name']));
             $xml_agent->addChild('logintime', is_null($infoAgente['total_login_time']) ? 0 : $infoAgente['total_login_time']);
 
             $listaResumen = array('incoming' => array(), 'outgoing' => array());
@@ -4114,7 +4410,7 @@ LEER_ULTIMA_SESION;
             $this->_agregarRespuestaFallo($xml_getchanvarsResponse, 417, 'Agent not in call');
             return $xml_response;
         }
-        $xml_getchanvarsResponse->addChild('clientchannel', str_replace('&', '&amp;', $sCanalRemoto));
+        $xml_getchanvarsResponse->addChild('clientchannel', xmlSafe($sCanalRemoto));
         $xml_chanvars = $xml_getchanvarsResponse->addChild('chanvars');
 
         // Listar la información disponible sobre las variables de canal
@@ -4127,8 +4423,8 @@ LEER_ULTIMA_SESION;
                     $bSeccionVars = TRUE;
                 } elseif ($bSeccionVars && preg_match('/^(\w+)=(.*)$/', $sLinea, $regs)) {
                 	$xml_chanvar = $xml_chanvars->addChild('chanvar');
-                    $xml_chanvar->addChild('label', str_replace('&', '&amp;', $regs[1]));
-                    $xml_chanvar->addChild('value', str_replace('&', '&amp;', $regs[2]));
+                    $xml_chanvar->addChild('label', xmlSafe($regs[1]));
+                    $xml_chanvar->addChild('value', xmlSafe($regs[2]));
                 } elseif (trim($sLinea) == '') {
                 	$bSeccionVars = FALSE;
                 }
@@ -4263,7 +4559,7 @@ LOG_CAMPANIA_SALIENTE;
         foreach ($recordset as $tupla) {
             $xml_logentry = $xml_logentries->addChild('logentry');
         	foreach ($tupla as $k => $v) if (!is_null($v)) {
-        		$xml_logentry->addChild($k, str_replace('&', '&amp;', $v));
+        		$xml_logentry->addChild($k, xmlSafe($v));
         	}
         }
         return $xml_response;
@@ -4335,12 +4631,36 @@ LOG_CAMPANIA_SALIENTE;
             case 'PJSIP':
                 $result = $this->_ami->Command("pjsip show endpoint $sPeer");
                 if (isset($result['data']) && strpos($result['data'], 'Not Found') === false) {
+                    /* Estados de contacto en Asterisk 18: Avail, Unavail, Unknown,
+                     * NonQual, Created, Removed. Solo Avail (contacto presente y
+                     * alcanzable) cuenta como registrado.
+                     * stripos($line, 'Avail') era incorrecto porque 'Unavail' lo
+                     * contiene como subcadena, de modo que un contacto muerto se
+                     * reportaba como registrado. Se compara token por token.
+                     * NOTA: 'NONQUAL' (qualify deshabilitado) sigue contando como
+                     * no registrado, igual que antes. Agregarlo a este arreglo si
+                     * se decide aceptar extensiones con qualify apagado. */
+                    /* Asterisk 18 contact statuses: Avail, Unavail, Unknown,
+                     * NonQual, Created, Removed. Only Avail (contact present and
+                     * reachable) counts as registered.
+                     * stripos($line, 'Avail') was wrong because 'Unavail' contains
+                     * it as a substring, so a dead contact was reported as
+                     * registered. Compare token by token instead.
+                     * NOTE: 'NONQUAL' (qualify disabled) still counts as not
+                     * registered, same as before. Add it to this array if
+                     * extensions with qualify turned off should be accepted. */
+                    $estadosRegistrado = array('AVAIL');
                     $lines = explode("\n", $result['data']);
                     foreach ($lines as $line) {
-                        // Contact line with "Avail" means endpoint has a registered contact
-                        if (stripos($line, 'Contact:') !== false && stripos($line, 'Avail') !== false) {
-                            $bRegistered = TRUE;
-                            break;
+                        if (stripos($line, 'Contact:') === false) continue;
+
+                        // Contact:  <Aor/ContactUri> <Hash> <Status> <RTT(ms)>
+                        $campos = preg_split('/\s+/', trim($line), -1, PREG_SPLIT_NO_EMPTY);
+                        foreach ($campos as $campo) {
+                            if (in_array(strtoupper($campo), $estadosRegistrado)) {
+                                $bRegistered = TRUE;
+                                break 2;
+                            }
                         }
                     }
                 }

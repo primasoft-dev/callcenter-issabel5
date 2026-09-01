@@ -74,6 +74,18 @@ class CampaignProcess extends TuberiaProcess
     private $_asteriskVersion = array(1, 4, 0, 0);
     private $_compat = NULL; // AsteriskCompat instance for version-aware behavior
 
+    /* Fecha/hora de arranque de esta instancia de Asterisk, según CoreStatus.
+     * Se usa para detectar reinicios de Asterisk entre reconexiones AMI.
+     * Startup date/time of this Asterisk instance, per CoreStatus. Used to
+     * detect Asterisk restarts across AMI reconnections. */
+    private $_asteriskStartTime = NULL;
+
+    /* VERDADERO si se detectó que Asterisk fue reiniciado y todavía no se ha
+     * procesado la resincronización correspondiente.
+     * TRUE if an Asterisk restart was detected and the corresponding
+     * resynchronization has not been processed yet. */
+    private $_bReinicioAsterisk = FALSE;
+
     /* VERDADERO si al momento de verificar actividad en tubería, no habían
      * mensajes pendientes. Sólo cuando se esté ocioso se intentarán verificar
      * nuevas llamadas de la campaña.
@@ -88,12 +100,6 @@ class CampaignProcess extends TuberiaProcess
      * should be placed.
      */
     private $_finalizandoPrograma = FALSE;
-
-    /* Agents claimed by campaigns in current review cycle.
-     * Prevents same agent from being counted as free by multiple campaigns.
-     * Reset at start of each _actualizarCampanias() cycle.
-     */
-    private $_agentesReclamados = array();
 
     /* N-way rotation tracking (persistent across cycles)
      * Seguimiento de rotación N-vías (persistente entre ciclos) */
@@ -224,7 +230,7 @@ class CampaignProcess extends TuberiaProcess
         if (isset($infoConfig['database']) && isset($infoConfig['database']['dbpass']))
             $dbPass = $infoConfig['database']['dbpass'];
 
-        return array("mysql:host=$dbHost;dbname=call_center", $dbUser, $dbPass);
+        return array("mysql:host=$dbHost;dbname=call_center;charset=utf8mb4", $dbUser, $dbPass);
     }
 
     private function _iniciarConexionDB()
@@ -308,17 +314,32 @@ class CampaignProcess extends TuberiaProcess
             } else {
                 $this->_log->output('INFO: conexión a Asterisk restaurada, se reinicia operación normal. | EN: Asterisk connection restored, resuming normal operation.');
 
-                /* TODO: si el Asterisk ha sido reiniciado, probablemente ha
-                 * olvidado la totalidad de las llamadas en curso, así como los
-                 * agentes que estaban logoneados. Es necesario implementar una
-                 * verificación de si los agentes están logoneados, y resetear
-                 * todo el estado del marcador si la información interna del
-                 * marcador está desactualizada.
-                 * TODO: if Asterisk has been restarted, it has probably forgotten
-                 * all ongoing calls as well as agents that were logged in. It is
-                 * necessary to implement a check for whether agents are logged in,
-                 * and reset all dialer state if the dialer's internal information
-                 * is outdated. */
+                if ($this->_bReinicioAsterisk) {
+                    $this->_bReinicioAsterisk = FALSE;
+
+                    $this->_log->output('WARN: Asterisk fue reiniciado, se fuerza limpieza inmediata de '.
+                        'llamadas huérfanas y se solicita verificación de agentes logoneados. | '.
+                        'EN: Asterisk was restarted, forcing immediate orphaned-call cleanup and '.
+                        'requesting a login verification for logged-in agents.');
+
+                    // Todas las llamadas Placing/Ringing/Success(sin end_time)/OnHold son
+                    // huérfanas con certeza: Asterisk acaba de reiniciarse y no puede tener
+                    // memoria de ellas, así que se limpian de inmediato sin esperar los
+                    // timeouts normales (5 minutos / 2 horas).
+                    // All Placing/Ringing/Success(no end_time)/OnHold calls are certainly
+                    // orphaned: Asterisk just restarted and cannot have any memory of them,
+                    // so they are cleaned immediately instead of waiting for the normal
+                    // timeouts (5 minutes / 2 hours).
+                    $this->_cleanOrphanedPlacingCalls(0);
+                    $this->_cleanOrphanedConnectedCalls(0);
+
+                    // Forzar una verificación fresca de qué agentes siguen realmente
+                    // logoneados; el estado en DB puede seguir marcándolos como
+                    // logoneados de antes del reinicio.
+                    // Force a fresh check of which agents are actually still logged in;
+                    // DB state may still show them logged in from before the restart.
+                    $this->_tuberia->msg_SQLWorkerProcess_requerir_nuevaListaAgentes();
+                }
             }
         }
 
@@ -403,6 +424,45 @@ class CampaignProcess extends TuberiaProcess
                 $this->_log->output("INFO: no hay soporte CoreSettings en Asterisk Manager, se asume Asterisk 1.4.x. | EN: no CoreSettings support in Asterisk Manager, assuming Asterisk 1.4.x.");
             }
             $this->_compat = new AsteriskCompat($this->_asteriskVersion);
+
+            /* Ejecutar el comando CoreStatus para obtener la fecha de arranque de
+             * Asterisk. Si se tiene una fecha previa distinta a la obtenida aquí,
+             * se concluye que Asterisk ha sido reiniciado. Durante el inicio
+             * temprano de Asterisk, la fecha de inicio todavía no está lista y
+             * se reportará como 1969-12-31 o similar. Se debe de repetir la llamada
+             * hasta que reporte una fecha válida.
+             * Execute CoreStatus command to get Asterisk startup date.
+             * If a previous different date is obtained than what we have here,
+             * it is concluded that Asterisk has been restarted. During early
+             * Asterisk startup, the start date is not yet ready and
+             * will be reported as 1969-12-31 or similar. The call must be repeated
+             * until it reports a valid date. */
+            $sFechaInicio = ''; $bFechaValida = FALSE;
+            do {
+                $r = $astman->CoreStatus();
+                if (isset($r['Response']) && $r['Response'] == 'Success') {
+                    $sFechaInicio = $r['CoreStartupDate'].' '.$r['CoreStartupTime'];
+                    $this->_log->output('INFO: esta instancia de Asterisk arrancó en: '.$sFechaInicio.' | EN: this Asterisk instance started at: '.$sFechaInicio);
+                } else {
+                    $this->_log->output('INFO: esta versión de Asterisk no soporta CoreStatus | EN: this Asterisk version does not support CoreStatus');
+                    break;
+                }
+                $regs = NULL;
+                if (preg_match('/^(\d+)/', $sFechaInicio, $regs) && (int)$regs[1] <= 1970) {
+                    $this->_log->output('INFO: fecha de inicio de Asterisk no está lista, se espera | EN: Asterisk start date not ready yet, waiting');
+                    usleep(1 * 1000000);
+                } else {
+                    $bFechaValida = TRUE;
+                }
+            } while (!$bFechaValida);
+
+            if (is_null($this->_asteriskStartTime)) {
+                $this->_asteriskStartTime = $sFechaInicio;
+            } elseif ($this->_asteriskStartTime != $sFechaInicio) {
+                $this->_log->output('INFO: esta instancia de Asterisk ha sido reiniciada, se eliminará información obsoleta... | EN: this Asterisk instance has been restarted, removing obsolete information...');
+                $this->_asteriskStartTime = $sFechaInicio;
+                $this->_bReinicioAsterisk = TRUE;
+            }
 
             /* CampaignProcess no tiene manejadores de eventos AMI. Aunque el
              * objeto Predictor hace uso de eventos para recoger el resultado
@@ -607,7 +667,6 @@ PETICION_CAMPANIAS_ENTRANTES;
             $this->_campaignIntentions = array();
             $this->_campaignMaxCanales = array();
             $this->_campaignRawMaxCanales = array();
-            $this->_agentesReclamados = array();
             $this->_predictiveSlotsUsed = array();
 
             foreach ($listaCampanias['outgoing'] as $campaignData) {
@@ -780,7 +839,6 @@ PETICION_CAMPANIAS_ENTRANTES;
                 if ($allocationCount[$campaignId] < $limit) {
                     $allocated[$campaignId][] = $agent;
                     $allocationCount[$campaignId]++;
-                    $this->_agentesReclamados[$agent] = $campaignId;
                 } else {
                     if ($this->DEBUG) {
                         $this->_log->output("DEBUG: ".__METHOD__.
@@ -796,7 +854,6 @@ PETICION_CAMPANIAS_ENTRANTES;
                 if (!is_null($winningCampaign)) {
                     $allocated[$winningCampaign][] = $agent;
                     $allocationCount[$winningCampaign]++;
-                    $this->_agentesReclamados[$agent] = $winningCampaign;
 
                     if ($this->DEBUG) {
                         $this->_log->output("DEBUG: ".__METHOD__.
@@ -818,52 +875,6 @@ PETICION_CAMPANIAS_ENTRANTES;
         }
 
         return $allocated;
-    }
-
-    /**
-     * Get the winning campaign for a shared agent using N-way rotation.
-     * Obtener la campaña ganadora para un agente compartido usando rotación N-vías.
-     *
-     * @param string $agent The agent identifier
-     * @param array $campaigns List of campaign IDs that want this agent
-     * @return int The campaign ID that wins this rotation
-     */
-    private function _getRotationWinner($agent, $campaigns)
-    {
-        sort($campaigns);  // Ensure consistent order / Asegurar orden consistente
-        $campaignsKey = implode(',', $campaigns);
-
-        // Initialize or update rotation tracking for this agent
-        // Inicializar o actualizar seguimiento de rotación para este agente
-        if (!isset($this->_agentRotation[$agent]) ||
-            $this->_agentRotation[$agent]['key'] !== $campaignsKey) {
-            // New agent or campaign set changed - initialize rotation
-            // Nuevo agente o conjunto de campañas cambió - inicializar rotación
-            $this->_agentRotation[$agent] = array(
-                'key' => $campaignsKey,
-                'campaigns' => $campaigns,
-                'index' => 0,
-            );
-        }
-
-        // Get current winner based on rotation index
-        // Obtener ganador actual basado en índice de rotación
-        $rotation = &$this->_agentRotation[$agent];
-        $winnerIndex = $rotation['index'] % count($rotation['campaigns']);
-        $winner = $rotation['campaigns'][$winnerIndex];
-
-        // Advance rotation for next cycle / Avanzar rotación para próximo ciclo
-        $rotation['index']++;
-
-        if ($this->DEBUG) {
-            $this->_log->output("DEBUG: ".__METHOD__.
-                " agent $agent rotation: index={$rotation['index']}, ".
-                "campaigns=[".implode(',', $campaigns)."], winner=$winner | ".
-                "agente $agent rotación: índice={$rotation['index']}, ".
-                "campañas=[".implode(',', $campaigns)."], ganador=$winner");
-        }
-
-        return $winner;
     }
 
     /**
@@ -1383,508 +1394,6 @@ SQL_LLAMADA_COLOCADA;
         return TRUE;
     }
 
-    // Dead code - no longer called. Replaced by fair-rotation path:
-    //   Pass 1: _actualizarCampanias() collects intentions
-    //   Allocate: _resolveAgentRotation() distributes agents
-    //   Pass 2: _processCampaignWithAllocation() processes campaigns
-    private function _actualizarLlamadasCampania($infoCampania, $oPredictor)
-    {
-        $iTimeoutOriginate = $this->_configDB->dialer_timeout_originate;
-        if (is_null($iTimeoutOriginate) || $iTimeoutOriginate <= 0)
-            $iTimeoutOriginate = NULL;
-        else $iTimeoutOriginate *= 1000; // convertir a milisegundos
-                                        // convert to milliseconds
-
-        // Construir patrón de marcado a partir de trunk de campaña
-        // Build dialing pattern from campaign trunk
-        $datosTrunk = $this->_construirPlantillaMarcado($infoCampania['trunk']);
-        if (is_null($datosTrunk)) {
-            $this->_log->output("ERR: no se puede construir plantilla de marcado a partir de trunk '{$infoCampania['trunk']}'! | EN: cannot build dial template from trunk '{$infoCampania['trunk']}'!");
-            $this->_log->output("ERR: Revise los mensajes previos. Si el problema es un tipo de trunk no manejado, ".
-                "se requiere informar este tipo de trunk y/o actualizar su versión de CallCenter | EN: Review previous messages. If the problem is an unhandled trunk type, ".
-                "this trunk type needs to be reported and/or update your CallCenter version");
-            return FALSE;
-        }
-
-        // Leer cuántas llamadas (como máximo) se pueden hacer por campaña
-        // Read how many calls (at most) can be made per campaign
-        $iNumLlamadasColocar = $infoCampania['max_canales'];
-        if (!is_null($iNumLlamadasColocar) && $iNumLlamadasColocar <= 0)
-            $iNumLlamadasColocar = NULL;
-
-        // Listar todas las llamadas agendables para la campaña
-        // List all schedulable calls for the campaign
-        $listaLlamadasAgendadas = $this->_actualizarLlamadasAgendables($infoCampania, $datosTrunk);
-
-        // Averiguar cuantas llamadas se pueden hacer (por predicción), y tomar
-        // el menor valor de entre máx campaña y predictivo.
-        // Find out how many calls can be made (by prediction), and take the
-        // lower value between campaign max and predictive.
-        if ($this->DEBUG) {
-            $this->_log->output('DEBUG: '.__METHOD__.' verificando agentes libres... | EN: checking free agents...');
-        }
-
-        // Parámetros requeridos para predicción de colocación de llamadas
-        // Parameters required for call placement prediction
-        $infoCola = $this->_tuberia->AMIEventProcess_infoPrediccionCola($infoCampania['queue'], $this->_configDB->dialer_predictivo);
-        if (is_null($infoCola)) {
-            if ($oPredictor->examinarColas(array($infoCampania['queue']))) {
-                $infoCola = $oPredictor->infoPrediccionCola($infoCampania['queue'], $this->_configDB->dialer_predictivo);
-            }
-        }
-
-        if (is_null($infoCola)) {
-            $this->_log->output('ERR: '.__METHOD__." no se puede obtener información de ".
-                "estado de cola para (campania {$infoCampania['id']} ".
-                "cola {$infoCampania['queue']}). | EN: cannot get queue status information for (campaign {$infoCampania['id']} queue {$infoCampania['queue']}).");
-            return FALSE;
-        }
-
-        $resumenPrediccion = ($this->_configDB->dialer_predictivo && ($infoCampania['num_completadas'] >= MIN_MUESTRAS))
-            ? $oPredictor->predecirNumeroLlamadas($infoCola,
-                $this->_configDB->dialer_qos,
-                $infoCampania['promedio'],
-                $this->_leerTiempoContestar($infoCampania['id']))
-            : $oPredictor->predecirNumeroLlamadas($infoCola);
-        if ($this->DEBUG) {
-            $this->_log->output('DEBUG: '.__METHOD__." (campania/campaign {$infoCampania['id']} ".
-                "cola/queue {$infoCampania['queue']}): resumen de predicción / prediction summary:\n".
-                    "\tagentes libres / free agents.........: {$resumenPrediccion['AGENTES_LIBRES']}\n".
-                    "\tagentes por desocuparse / agents about to become free: {$resumenPrediccion['AGENTES_POR_DESOCUPAR']}\n".
-                    "\tclientes en espera / clients waiting.....: {$resumenPrediccion['CLIENTES_ESPERA']}");
-        }
-        $iMaxPredecidos = $resumenPrediccion['AGENTES_LIBRES'] + $resumenPrediccion['AGENTES_POR_DESOCUPAR'] - $resumenPrediccion['CLIENTES_ESPERA'];
-
-        if ($iMaxPredecidos < 0) $iMaxPredecidos = 0;
-        if (is_null($iNumLlamadasColocar) || $iNumLlamadasColocar > $iMaxPredecidos)
-            $iNumLlamadasColocar = $iMaxPredecidos;
-
-        // Agent conflict detection: reduce available agents by those already claimed
-        // Detección de conflicto de agentes: reducir agentes disponibles por los ya reclamados
-        if (isset($infoCola['AGENTES_LIBRES_LISTA']) && count($infoCola['AGENTES_LIBRES_LISTA']) > 0) {
-            $agentesLibresActuales = array();
-            $agentesConflicto = 0;
-
-            foreach ($infoCola['AGENTES_LIBRES_LISTA'] as $sAgentInterface) {
-                // Normalize: Local/1001@agents -> Agent/1001
-                $sNormalizado = $sAgentInterface;
-                if (!is_null($this->_compat)) {
-                    $tmp = $this->_compat->normalizeAgentFromInterface($sAgentInterface);
-                    if (!is_null($tmp)) $sNormalizado = $tmp;
-                }
-
-                if (isset($this->_agentesReclamados[$sNormalizado])) {
-                    $agentesConflicto++;
-                    if ($this->DEBUG) {
-                        $this->_log->output("DEBUG: ".__METHOD__." (campaign {$infoCampania['id']} ".
-                            "queue {$infoCampania['queue']}) agent $sNormalizado already claimed by campaign ".
-                            $this->_agentesReclamados[$sNormalizado]);
-                    }
-                } else {
-                    $agentesLibresActuales[] = $sNormalizado;
-                }
-            }
-
-            // Reduce prediction by conflicting agents
-            if ($agentesConflicto > 0) {
-                $iNumLlamadasColocarOriginal = $iNumLlamadasColocar;
-                $iNumLlamadasColocar -= $agentesConflicto;
-                if ($iNumLlamadasColocar < 0) $iNumLlamadasColocar = 0;
-
-                if ($this->DEBUG) {
-                    $this->_log->output("DEBUG: ".__METHOD__." (campaign {$infoCampania['id']} ".
-                        "queue {$infoCampania['queue']}) reduced iNumLlamadasColocar from $iNumLlamadasColocarOriginal ".
-                        "to $iNumLlamadasColocar due to $agentesConflicto conflicting agents");
-                }
-            }
-
-            // Claim available agents for this campaign
-            foreach ($agentesLibresActuales as $sAgente) {
-                $this->_agentesReclamados[$sAgente] = $infoCampania['id'];
-            }
-        }
-
-
-        // En Asterisk13 el Originate Response llega tarde, luego de que el llamado termina, no podemos considerar que está pendiente
-        // In Asterisk13 the Originate Response arrives late, after the call ends, we cannot consider it pending
-        // Por ese motivo comentamos por ahora este bloque, para ver cual es el mejor curso de accion en el futuro y evitar
-        // For this reason we comment out this block for now, to see what the best course of action is in the future and avoid
-        // colocar llamados cuando hay algunos pendientes todavia.
-        // placing calls when there are still some pending.
-
-        if ($iNumLlamadasColocar > 0) {
-
-            // El valor de llamadas predichas no toma en cuenta las llamadas que han
-            // sido generadas pero todavía no se recibe su OriginateResponse. Para
-            // evitar sobrecolocar mientras las primeras llamadas esperan ser
-            // contestadas, se cuentan tales llamadas y se resta.
-            // The value of predicted calls does not take into account calls that have
-            // been generated but whose OriginateResponse has not yet been received. To
-            // avoid over-placing while the first calls wait to be answered, such calls
-            // are counted and subtracted.
-
-            $iNumEsperanRespuesta = count($listaLlamadasAgendadas) + $this->_contarLlamadasEsperandoRespuesta($infoCampania['queue']);
-
-            if ($iNumLlamadasColocar > $iNumEsperanRespuesta) {
-                $iNumLlamadasColocar -= $iNumEsperanRespuesta;
-            } else { 
-                $iNumLlamadasColocar = 0;
-            }
-        }
-
-        if (count($listaLlamadasAgendadas) <= 0 && $iNumLlamadasColocar <= 0) {
-            if ($this->DEBUG) {
-                $this->_log->output("DEBUG: ".__METHOD__." (campania {$infoCampania['id']} cola ".
-                    "{$infoCampania['queue']}) no hay agentes libres ni a punto ".
-                    "de desocuparse! | EN: (campaign {$infoCampania['id']} queue ".
-                    "{$infoCampania['queue']}) no free agents or about to become free!");
-            }
-            return FALSE;
-        }
-
-        if ($this->DEBUG) {
-            $this->_log->output("DEBUG: ".__METHOD__." (campania {$infoCampania['id']} cola ".
-                "{$infoCampania['queue']}) se pueden colocar un máximo de ".
-                "$iNumLlamadasColocar llamadas... | EN: can place maximum of ".
-                "$iNumLlamadasColocar calls...");
-        }
-
-        if ($iNumLlamadasColocar > 0 && $this->_configDB->dialer_overcommit) {
-            // Para compensar por falla de llamadas, se intenta colocar más de la cuenta. El porcentaje
-            // de llamadas a sobre-colocar se determina a partir de la historia pasada de la campaña.
-            // To compensate for call failures, we try to place more than the count. The percentage
-            // of calls to over-place is determined from the campaign's past history.
-            $iVentanaHistoria = 60 * 30; // TODO: se puede autocalcular?
-                                        // TODO: can it be auto-calculated?
-            $sPeticionASR =
-                'SELECT COUNT(*) AS total, SUM(IF(status = "Failure" OR status = "NoAnswer", 0, 1)) AS exito ' .
-                'FROM calls ' .
-                'WHERE id_campaign = ? AND status IS NOT NULL ' .
-                    'AND status <> "Placing" ' .
-                    'AND fecha_llamada IS NOT NULL ' .
-                    'AND fecha_llamada >= ?';
-            $recordset = $this->_db->prepare($sPeticionASR);
-            $recordset->execute(array($infoCampania['id'], date('Y-m-d H:i:s', time() - $iVentanaHistoria)));
-            $tupla = $recordset->fetch(PDO::FETCH_ASSOC);
-            $recordset->closeCursor();
-
-            // Sólo considerar para más de 10 llamadas colocadas durante ventana
-            // Only consider for more than 10 calls placed during window
-            if ($tupla['total'] >= 10 && $tupla['exito'] > 0) {
-                $ASR = $tupla['exito'] / $tupla['total'];
-                $ASR_safe = $ASR;
-                if ($ASR_safe < 0.20) $ASR_safe = 0.20;
-                $iNumLlamadasColocar = (int)round($iNumLlamadasColocar / $ASR_safe);
-
-                // Re-cap by max_canales after overcommit to respect trunk capacity
-                // Re-limitar por max_canales después de sobre-colocación para respetar capacidad del trunk
-                if (!is_null($infoCampania['max_canales']) && $infoCampania['max_canales'] > 0
-                    && $iNumLlamadasColocar > $infoCampania['max_canales']) {
-                    $iBeforeRecap = $iNumLlamadasColocar;
-                    $iNumLlamadasColocar = $infoCampania['max_canales'];
-                    if ($this->DEBUG) {
-                        $this->_log->output(
-                            "DEBUG: (campaign {$infoCampania['id']} queue {$infoCampania['queue']}) ".
-                            "overcommit capped from $iBeforeRecap to {$infoCampania['max_canales']} by max_canales (trunk limit) | ".
-                            "(campaña {$infoCampania['id']} cola {$infoCampania['queue']}) ".
-                            "sobre-colocación limitada de $iBeforeRecap a {$infoCampania['max_canales']} por max_canales (límite de trunk)");
-                    }
-                }
-
-                if ($this->DEBUG) {
-                    $this->_log->output(
-                        "DEBUG: (campania {$infoCampania['id']} cola {$infoCampania['queue']}) ".
-                        "en los últimos $iVentanaHistoria seg. tuvieron éxito " .
-                        "{$tupla['exito']} de {$tupla['total']} llamadas colocadas (ASR=".(sprintf('%.2f', $ASR * 100))."%). Se colocan " .
-                        "$iNumLlamadasColocar para compensar. | EN: (campaign {$infoCampania['id']} queue {$infoCampania['queue']}) ".
-                        "in the last $iVentanaHistoria sec. " .
-                        "{$tupla['exito']} of {$tupla['total']} placed calls succeeded (ASR=".(sprintf('%.2f', $ASR * 100))."%). Placing " .
-                        "$iNumLlamadasColocar to compensate.");
-                }
-            }
-        }
-
-
-        // Leer tantas llamadas como fueron elegidas. Sólo se leen números con
-        // status == NULL y bandera desactivada
-        // Read as many calls as were selected. Only numbers with status == NULL
-        // and flag deactivated are read
-        $listaLlamadas = $listaLlamadasAgendadas;
-        $iNumTotalLlamadas = count($listaLlamadas);
-        if ($iNumLlamadasColocar > 0) {
-            $sFechaSys = date('Y-m-d');
-            $sHoraSys = date('H:i:s');
-            $sPeticionLlamadas = <<<PETICION_LLAMADAS
-(SELECT 1 AS dummy_priority, id_campaign, id, phone, date_init AS dummy_date_init,
-    time_init AS dummy_time_init, date_end AS dummy_date_end,
-    time_end AS dummy_time_end, retries
-FROM calls
-WHERE id_campaign = ?
-    AND (status IS NULL
-        OR status NOT IN ("Success", "Placing", "Ringing", "OnQueue", "OnHold"))
-    AND retries < ?
-    AND dnc = 0
-    AND (? BETWEEN date_init AND date_end AND ? BETWEEN time_init AND time_end)
-    AND agent IS NULL)
-UNION
-(SELECT 2 AS dummy_priority, id_campaign, id, phone, date_init AS dummy_date_init,
-    time_init AS dummy_time_init, date_end AS dummy_date_end,
-    time_end AS dummy_time_end, retries
-FROM calls
-WHERE id_campaign = ?
-    AND (status IS NULL
-        OR status NOT IN ("Success", "Placing", "Ringing", "OnQueue", "OnHold"))
-    AND retries < ?
-    AND dnc = 0
-    AND date_init IS NULL AND date_end IS NULL AND time_init IS NULL AND time_end IS NULL
-    AND agent IS NULL)
-ORDER BY dummy_priority, retries, dummy_date_end, dummy_time_end, dummy_date_init, dummy_time_init, id
-LIMIT 0,?
-PETICION_LLAMADAS;
-            $recordset = $this->_db->prepare($sPeticionLlamadas);
-            $recordset->execute(array(
-                $infoCampania['id'],
-                $infoCampania['retries'],
-                $sFechaSys, $sHoraSys,
-                $infoCampania['id'],
-                $infoCampania['retries'],
-                $iNumLlamadasColocar));
-            $recordset->setFetchMode(PDO::FETCH_ASSOC);
-            $pid = posix_getpid();
-            foreach ($recordset as $tupla) {
-                $iNumTotalLlamadas++;
-                $sKey = sprintf('%d-%d-%d', $pid, $infoCampania['id'], $tupla['id']);
-                $sCanalTrunk = str_replace('$OUTNUM$', $tupla['phone'], $datosTrunk['TRUNK']);
-
-                /* Para poder monitorear el evento Onnewchannel, se depende de
-                 * la cadena de marcado para identificar cuál de todos los eventos
-                 * es el correcto. Si una llamada generada produce la misma cadena
-                 * de marcado que una que ya se monitorea, o que otra en la misma
-                 * lista, ocurrirán confusiones entre los eventos. Se filtran las
-                 * llamadas que tengan cadenas de marcado repetidas.
-                 * To monitor the Onnewchannel event, we depend on the dial string
-                 * to identify which of all events is the correct one. If a generated
-                 * call produces the same dial string as one already being monitored,
-                 * or another in the same list, confusion will occur between events.
-                 * Calls with repeated dial strings are filtered out. */
-                if (!isset($listaLlamadas[$tupla['phone']])) {
-                    // Llamada no repetida, se procesa normalmente
-                    // Non-repeated call, processed normally
-                    $tupla['actionid'] = $sKey;
-                    $tupla['dialstring'] = $sCanalTrunk;
-                    $tupla['agent'] = NULL; // Marcar la llamada como no agendada
-                                            // Mark call as not scheduled
-                	$listaLlamadas[$tupla['phone']] = $tupla;
-                } else {
-                	// Se ha encontrado en la lectura un número de teléfono repetido
-                    // A repeated phone number was found in the reading
-                    $this->_log->output("INFO: se ignora llamada $sKey con DialString ".
-                        "$sCanalTrunk - mismo DialString usado por llamada a punto de originar. | EN: call $sKey with DialString ".
-                        "$sCanalTrunk ignored - same DialString used by call about to originate.");
-                }
-            }
-        }
-
-        if ($iNumTotalLlamadas <= 0) {
-            /* Debido a que ahora las llamadas pueden agendarse a una hora
-             * específica, puede ocurrir que la lista de llamadas por realizar
-             * esté vacía porque hay llamadas agendadas, pero fuera del horario
-             * indicado por la hora del sistema. Si la cuenta del query de abajo
-             * devuelve al menos una llamada, se interrumpe el procesamiento y
-             * se sale.
-             * Because calls can now be scheduled for a specific time, it may
-             * happen that the list of calls to make is empty because there are
-             * scheduled calls, but outside the time indicated by the system time.
-             * If the count of the query below returns at least one call, processing
-             * is interrupted and we exit.
-             */
-            $sPeticionTotal =
-                'SELECT COUNT(*) AS N FROM calls '.
-                'WHERE id_campaign = ? '.
-                    'AND (status IS NULL OR status NOT IN ("Success", "Placing", "Ringing", "OnQueue", "OnHold")) '.
-                    'AND retries < ? '.
-                    'AND dnc = 0';
-            $recordset = $this->_db->prepare($sPeticionTotal);
-            $recordset->execute(array($infoCampania['id'], $infoCampania['retries']));
-            $iNumTotal = $recordset->fetch(PDO::FETCH_COLUMN, 0);
-            $recordset->closeCursor();
-            if (!is_null($iNumTotal) && $iNumTotal > 0) {
-                if ($this->DEBUG) {
-                    $this->_log->output("DEBUG: ".__METHOD__." (campania {$infoCampania['id']} ".
-                        "cola {$infoCampania['queue']}) no hay llamadas a ".
-                        "colocar; $iNumTotal llamadas agendadas pero fuera de ".
-                        "horario. | EN: (campaign {$infoCampania['id']} ".
-                        "queue {$infoCampania['queue']}) no calls to ".
-                        "place; $iNumTotal scheduled calls but outside ".
-                        "time range.");
-                }
-                return FALSE;
-            }
-        }
-
-        /* Verificar si las llamadas están colocadas en la lista de Do Not Call.
-         * Esto puede ocurrir incluso si la bandera dnc es 0, si la lista se
-         * actualiza luego de cargar la lista de llamadas salientes.
-         * Check if calls are on the Do Not Call list. This can happen even if
-         * the dnc flag is 0, if the list is updated after loading the outgoing
-         * call list. */
-        $recordset = $this->_db->prepare(
-            'SELECT COUNT(*) FROM dont_call WHERE caller_id = ? AND status = "A"');
-        $sth = $this->_db->prepare(
-            'UPDATE calls SET dnc = 1 WHERE id_campaign = ? AND id = ?');
-        foreach (array_keys($listaLlamadas) as $k) {
-            $recordset->execute(array($k));
-            $iNumDNC = $recordset->fetch(PDO::FETCH_COLUMN, 0);
-            $recordset->closeCursor();
-            if ($iNumDNC > 0) {
-            	if ($this->DEBUG) {
-            		$this->_log->output('DEBUG: '.__METHOD__." (campania {$infoCampania['id']} ".
-                        "número $k encontrado en lista DNC, no se marcará. | EN: number $k found in DNC list, will not be dialed.");
-            	}
-                $sth->execute(array($infoCampania['id'], $tupla['id']));
-                unset($listaLlamadas[$k]);
-            }
-        }
-
-        /* Mandar los teléfonos a punto de marcar a AMIEventProcess. Se espera
-         * de vuelta una lista de los números que ya están repetidos y en proceso
-         * de marcado.
-         * Send the phones about to be dialed to AMIEventProcess. We expect back
-         * a list of numbers that are already repeated and in the process of being
-         * dialed. */
-        if (count($listaLlamadas) > 0) {
-            $listaKeyRepetidos = $this->_tuberia->AMIEventProcess_nuevasLlamadasMarcar($listaLlamadas);
-            foreach ($listaKeyRepetidos as $k) {
-            	$sKey = $listaLlamadas[$k]['actionid'];
-                $sCanalTrunk = $listaLlamadas[$k]['dialstring'];
-                $this->_log->output("INFO: se ignora llamada $sKey con DialString ".
-                    "$sCanalTrunk - mismo DialString usado por llamada monitoreada. | EN: call $sKey with DialString ".
-                    "$sCanalTrunk ignored - same DialString used by monitored call.");
-                unset($listaLlamadas[$k]);
-            }
-        }
-
-        // Peticiones preparadas
-        // Prepared statements
-        $sPeticionLlamadaColocada = <<<SQL_LLAMADA_COLOCADA
-UPDATE calls SET status = 'Placing', datetime_originate = ?, fecha_llamada = NULL,
-    datetime_entry_queue = NULL, start_time = NULL, end_time = NULL,
-    duration_wait = NULL, duration = NULL, failure_cause = NULL,
-    failure_cause_txt = NULL, uniqueid = NULL, id_agent = NULL,
-    retries = retries + 1
-WHERE id_campaign = ? AND id = ?
-SQL_LLAMADA_COLOCADA;
-        $sth_placing = $this->_db->prepare($sPeticionLlamadaColocada);
-
-        // Generar realmente todas las llamadas leídas
-        // Actually generate all the calls read
-        $queue_monitor_format = NULL;
-        while (count($listaLlamadas) > 0) {
-            $tupla = array_shift($listaLlamadas);
-
-            $listaVars = array(
-                'ID_CAMPAIGN'   =>  $infoCampania['id'],
-                'ID_CALL'       =>  $tupla['id'],
-                'NUMBER'        =>  $tupla['phone'],
-                'QUEUE'         =>  $infoCampania['queue'],
-                'CONTEXT'       =>  $infoCampania['context'],
-            );
-            if (!is_null($tupla['agent'])) {
-                $listaVars['AGENTCHANNEL'] = $tupla['agent'];
-                if (is_null($queue_monitor_format))
-                    $queue_monitor_format = $this->_formatoGrabacionCola($infoCampania['queue']);
-                $listaVars['QUEUE_MONITOR_FORMAT'] = $queue_monitor_format;
-            }
-            $sCadenaVar = $this->_construirCadenaVariables($listaVars);
-            if ($this->DEBUG) {
-                $this->_log->output("DEBUG: ".__METHOD__." generando llamada | EN: generating call\n".
-                    "\tClave/Key....... {$tupla['actionid']}\n" .
-                    "\tAgente/Agent...... ".(is_null($tupla['agent']) ? '(ninguno/none)' : $tupla['agent'])."\n" .
-                    "\tDestino/Destination..... {$tupla['phone']}\n" .
-                    "\tCola/Queue........ {$infoCampania['queue']}\n" .
-                    "\tContexto/Context.... {$infoCampania['context']}\n" .
-                    "\tVar. Contexto/Context Var $sCadenaVar\n" .
-                    "\tTrunk....... ".(is_null($infoCampania['trunk']) ? '(por plan de marcado/by dial plan)' : $infoCampania['trunk'])."\n" .
-                    "\tPlantilla/Template... ".$datosTrunk['TRUNK']."\n" .
-                    "\tCaller ID... ".(isset($datosTrunk['CID']) ? $datosTrunk['CID'] : "(no definido/not defined)")."\n".
-                    "\tCadena de marcado/Dial string... {$tupla['dialstring']}\n".
-                    "\tTimeout marcado/Dial timeout..... ".(is_null($iTimeoutOriginate) ? '(por omisión/default)' : $iTimeoutOriginate.' ms.'));
-            }
-
-            /* La actualización de la llamada a estado Placing en la base de
-             * datos debe realizarse ANTES de ejecutar el Originate, y también
-             * debe de lanzarse el evento de progreso ANTES del originate. Se
-             * confía en que AMIEventProcess lanzará el evento de Failure si el
-             * Originate falla.
-             *
-             * La notificación de progreso de llamada se realiza a través de
-             * AMIEventProcess para garantizar el orden de eventos y de escrituras
-             * en la tabla call_progress_log.
-             *
-             * Si ocurre una excepción de base de datos aquí, se la deja
-             * propagar luego de rollback.
-             * The update of the call to Placing status in the database must be
-             * done BEFORE executing the Originate, and the progress event must
-             * also be launched BEFORE the originate. We trust that AMIEventProcess
-             * will launch the Failure event if the Originate fails.
-             *
-             * Call progress notification is done through AMIEventProcess to
-             * guarantee the order of events and writes in the call_progress_log
-             * table.
-             *
-             * If a database exception occurs here, it is left to propagate after
-             * rollback. */
-            try {
-                $this->_db->beginTransaction();
-
-                $iTimestampInicioOriginate = time();
-                $sth_placing->execute(array(
-                    date('Y-m-d H:i:s', $iTimestampInicioOriginate),
-                    $infoCampania['id'],
-                    $tupla['id']
-                ));
-
-                $this->_db->commit();
-            } catch (PDOException $e) {
-                if (!is_null($this->_db)) {
-                    $this->_db->rollBack();
-                }
-
-                // Se deshace AMIEventProcess_nuevasLlamadasMarcar sin marcar
-                // Undo AMIEventProcess_nuevasLlamadasMarcar without dialing
-                $this->_log->output('WARN: '.__METHOD__.' abortando '.
-                    count($listaLlamadas).' llamadas sin marcar debido a excepción de DB... | EN: aborting '.
-                    count($listaLlamadas).' undialed calls due to DB exception...');
-                $llamadasAbortar = array($tupla['actionid']);
-                foreach ($listaLlamadas as $t) $llamadasAbortar[] = $t['actionid'];
-                $this->_tuberia->msg_AMIEventProcess_abortarNuevasLlamadasMarcar($llamadasAbortar);
-
-                throw $e;
-            }
-
-            // Mandar a ejecutar la llamada a través de AMIEventProcess
-            // Send to execute the call through AMIEventProcess
-            $this->_tuberia->AMIEventProcess_ejecutarOriginate(
-                $tupla['actionid'], $iTimeoutOriginate, $iTimestampInicioOriginate,
-                (is_null($tupla['agent']) ? $infoCampania['context'] : 'llamada_agendada'),
-                (isset($datosTrunk['CID']) ? $datosTrunk['CID'] : $tupla['phone']),
-                $sCadenaVar, (is_null($tupla['retries']) ? 0 : $tupla['retries']) + 1,
-                $infoCampania['trunk']);
-        }
-
-        /* Si se llega a este punto, se presume que, con agentes disponibles, y
-         * campaña activa, se terminaron las llamadas. Por lo tanto la campaña
-         * ya ha terminado
-         * If we reach this point, it is presumed that, with available agents,
-         * and active campaign, the calls have finished. Therefore the campaign
-         * has already finished. */
-        if ($iNumLlamadasColocar > 0 && $iNumTotalLlamadas <= 0) {
-        	$this->_log->output('INFO: marcando campaña como finalizada: '.$infoCampania['id'].' | EN: marking campaign as finished: '.$infoCampania['id']);
-            $sth = $this->_db->prepare('UPDATE campaign SET estatus = "T" WHERE id = ?');
-            $sth->execute(array($infoCampania['id']));
-        }
-    }
-
     /* Leer el formato de grabación de la cola indicada por el parámetro, la cual
      * está indicada en queues_additional.conf
      * Read the recording format of the queue indicated by the parameter, which
@@ -2126,21 +1635,56 @@ PETICION_LLAMADAS_AGENTE;
             // This is a custom trunk that provides $OUTNUM$ already prepared
             return array('TRUNK' => $sTrunk);
         } elseif (strpos($sTrunk, 'SIP/') === 0
+            || stripos($sTrunk, 'PJSIP/') === 0
             || stripos($sTrunk, 'Zap/') === 0
             || stripos($sTrunk, 'DAHDI/') === 0
             || strpos($sTrunk,  'IAX/') === 0
             || strpos($sTrunk, 'IAX2/') === 0) {
-            // Este es un trunk Zap o SIP. Se debe concatenar el prefijo de marcado
-            // (si existe), y a continuación el número a marcar.
-            // This is a Zap or SIP trunk. The dialing prefix must be concatenated
-            // (if it exists), followed by the number to dial.
+            /* Este es un trunk Zap, SIP, PJSIP o IAX. Se debe concatenar el
+             * prefijo de marcado (si existe), y a continuación el número a marcar.
+             * PJSIP debe comprobarse por separado: 'PJSIP/' no empieza por 'SIP/'
+             * (strpos devuelve 2, no 0), asi que sin esta linea getTrunks() ofrece
+             * el trunk en la GUI pero la campaña lo rechaza como tipo desconocido
+             * y reintenta en bucle sin llegar a marcar nunca.
+             * _leerPropiedadesTrunk() ya resuelve PJSIP: pasa la tecnologia a
+             * minusculas y consulta asterisk.trunks con tech='pjsip'. */
+            /* This is a Zap, SIP, PJSIP or IAX trunk. The dialing prefix must be
+             * concatenated (if it exists), followed by the number to dial.
+             * PJSIP has to be checked separately: 'PJSIP/' does not start with
+             * 'SIP/' (strpos returns 2, not 0), so without this line getTrunks()
+             * offers the trunk in the GUI but the campaign rejects it as an
+             * unknown type and retries in a loop without ever dialling.
+             * _leerPropiedadesTrunk() already resolves PJSIP: it lowercases the
+             * technology and queries asterisk.trunks with tech='pjsip'. */
             $infoTrunk = $this->_leerPropiedadesTrunk($sTrunk);
             if (is_null($infoTrunk)) return NULL;
 
-            // SIP/TRUNKLABEL/<PREFIX>$OUTNUM$
-            $sPlantilla = $sTrunk.'/';
-            if (isset($infoTrunk['PREFIX'])) $sPlantilla .= $infoTrunk['PREFIX'];
-            $sPlantilla .= '$OUTNUM$';
+            $sPrefijo = isset($infoTrunk['PREFIX']) ? $infoTrunk['PREFIX'] : '';
+            if (stripos($sTrunk, 'PJSIP/') === 0) {
+                /* chan_pjsip no acepta la forma TECH/troncal/numero de chan_sip.
+                 * Su sintaxis es PJSIP/<usuario>@<endpoint>, y es exactamente lo
+                 * que hace issabelPBX en macro-dialout-trunk: arma primero
+                 * DIALSTR=<trunk>/<OUTNUM> y luego, si empieza por PJSIP, lo
+                 * reescribe con Set(DIALSTR=PJSIP/${OUTNUM}@${PJ}).
+                 * Con la forma de chan_sip el Originate falla de inmediato con
+                 * Response=Failure, Reason=0 y Uniqueid=<unknown>, porque
+                 * Asterisk rechaza la cadena de canal antes de crear el canal. */
+                /* chan_pjsip does not accept chan_sip's TECH/trunk/number form.
+                 * Its syntax is PJSIP/<user>@<endpoint>, which is exactly what
+                 * issabelPBX does in macro-dialout-trunk: it first builds
+                 * DIALSTR=<trunk>/<OUTNUM> and then, if it starts with PJSIP,
+                 * rewrites it with Set(DIALSTR=PJSIP/${OUTNUM}@${PJ}).
+                 * With the chan_sip form the Originate fails immediately with
+                 * Response=Failure, Reason=0 and Uniqueid=<unknown>, because
+                 * Asterisk rejects the channel string before creating a channel. */
+                list($sTecnologia, $sEndpoint) = explode('/', $sTrunk, 2);
+
+                // PJSIP/<PREFIX>$OUTNUM$@ENDPOINT
+                $sPlantilla = $sTecnologia.'/'.$sPrefijo.'$OUTNUM$@'.$sEndpoint;
+            } else {
+                // SIP/TRUNKLABEL/<PREFIX>$OUTNUM$
+                $sPlantilla = $sTrunk.'/'.$sPrefijo.'$OUTNUM$';
+            }
 
             // Agregar información de Caller ID, si está disponible
             // Add Caller ID information, if available
@@ -2370,7 +1914,7 @@ PETICION_LLAMADAS_AGENTE;
             return NULL;
         }
         try {
-            $dbConn = new PDO("mysql:host={$dbParams['AMPDBHOST']};dbname=asterisk",
+            $dbConn = new PDO("mysql:host={$dbParams['AMPDBHOST']};dbname=asterisk;charset=utf8mb4",
                 $dbParams['AMPDBUSER'], $dbParams['AMPDBPASS']);
             $dbConn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
             $dbConn->setAttribute(PDO::ATTR_EMULATE_PREPARES, FALSE);
@@ -2407,13 +1951,18 @@ PETICION_LLAMADAS_AGENTE;
      * @param int $campaignId The campaign ID
      * @return int Number of active calls
      */
-    private function _cleanOrphanedPlacingCalls()
+    /**
+     * @param int $iPlacingTimeout Seconds a Placing/Ringing call may be idle
+     *   before being considered orphaned. Pass 0 (e.g. right after a detected
+     *   Asterisk restart) to flush every such call immediately, since none of
+     *   them can possibly still be in progress.
+     */
+    private function _cleanOrphanedPlacingCalls($iPlacingTimeout = 300)
     {
-        // Timeout for Placing calls: 5 minutes (300 seconds)
+        // Timeout for Placing calls: 5 minutes (300 seconds) by default.
         // Calls stuck in Placing for longer are considered orphaned
-        // Timeout para llamadas Placing: 5 minutos (300 segundos)
+        // Timeout para llamadas Placing: 5 minutos (300 segundos) por omisión.
         // Las llamadas en Placing por más tiempo se consideran huérfanas
-        $iPlacingTimeout = 300;
         $sThreshold = date('Y-m-d H:i:s', time() - $iPlacingTimeout);
 
         $sPeticion = "UPDATE calls SET status = 'Failure', failure_cause = 0, "
@@ -2438,11 +1987,16 @@ PETICION_LLAMADAS_AGENTE;
      * Limpiar llamadas conectadas huérfanas que nunca recibieron end_time.
      * Son llamadas que fueron conectadas pero el evento Hangup se perdió.
      */
-    private function _cleanOrphanedConnectedCalls()
+    /**
+     * @param int $iConnectedTimeout Seconds a connected call may be idle
+     *   before being considered orphaned. Pass 0 (e.g. right after a detected
+     *   Asterisk restart) to flush every such call immediately, since none of
+     *   them can possibly still be connected.
+     */
+    private function _cleanOrphanedConnectedCalls($iConnectedTimeout = 7200)
     {
-        // Connected calls older than 2 hours with no end_time are definitely orphaned
-        // Llamadas conectadas de más de 2 horas sin end_time son definitivamente huérfanas
-        $iConnectedTimeout = 7200; // 2 hours in seconds
+        // Connected calls older than 2 hours (default) with no end_time are definitely orphaned
+        // Llamadas conectadas de más de 2 horas (por omisión) sin end_time son definitivamente huérfanas
         $sThreshold = date('Y-m-d H:i:s', time() - $iConnectedTimeout);
 
         $sPeticion = "UPDATE calls SET status = 'Hangup', end_time = start_time "

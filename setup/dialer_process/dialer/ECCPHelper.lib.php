@@ -22,6 +22,68 @@
   +----------------------------------------------------------------------+
   $Id: ECCPHelper.lib.php,v 1.48 2009/03/26 13:46:58 alex Exp $ */
 
+
+/**
+ * Preparar un valor arbitrario para insertarlo como texto en una respuesta XML
+ * del protocolo ECCP.
+ *
+ * SimpleXMLElement::addChild() escapa '<' y '>' por su cuenta, pero NO escapa
+ * '&': un '&' crudo provoca "unterminated entity reference" y descarta el valor
+ * completo. Por eso el escape de '&' se conserva exactamente como estaba en las
+ * 54 llamadas que esta funcion reemplaza. Lo que addChild() no maneja, y esta
+ * funcion agrega, es:
+ *
+ *   - UTF-8 invalido, que addChild() trunca en silencio en el primer byte malo,
+ *     sin emitir ninguna advertencia.
+ *   - Caracteres prohibidos en XML 1.0 (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F), que
+ *     hacen que libxml vacie el valor o, en versiones mas nuevas, que asXML()
+ *     falle por completo y devuelva FALSE, dejando al cliente sin respuesta.
+ *
+ * EN: Prepare an arbitrary value to be inserted as text into an ECCP protocol
+ * XML response.
+ *
+ * SimpleXMLElement::addChild() escapes '<' and '>' by itself, but does NOT
+ * escape '&': a raw '&' raises "unterminated entity reference" and drops the
+ * whole value. That is why the '&' escaping is kept exactly as it was in the 54
+ * call sites this function replaces. What addChild() does not handle, and this
+ * function adds, is:
+ *
+ *   - Invalid UTF-8, which addChild() silently truncates at the first bad byte,
+ *     without emitting any warning at all.
+ *   - Characters forbidden in XML 1.0 (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F), which
+ *     make libxml empty the value or, on newer versions, make asXML() fail
+ *     outright and return FALSE, leaving the client with no response.
+ *
+ * @param   mixed   $sValor     Valor a insertar / value to insert
+ *
+ * @return  string  Texto seguro para addChild() / text safe for addChild()
+ */
+function xmlSafe($sValor)
+{
+    $sValor = (string)$sValor;
+
+    // Reparar UTF-8 invalido antes de que addChild() lo trunque en silencio.
+    // Repair invalid UTF-8 before addChild() silently truncates it.
+    if ($sValor !== '' && !mb_check_encoding($sValor, 'UTF-8')) {
+        $mSustitutoPrevio = mb_substitute_character();
+        mb_substitute_character(0xFFFD);
+        $sValor = mb_convert_encoding($sValor, 'UTF-8', 'UTF-8');
+        mb_substitute_character($mSustitutoPrevio);
+    }
+
+    /* Quitar caracteres prohibidos en XML 1.0. Se opera byte a byte a proposito:
+     * todos estos bytes son < 0x80 y por lo tanto nunca aparecen dentro de una
+     * secuencia UTF-8 multibyte, cuyos bytes de continuacion son 0x80-0xBF. */
+    /* Strip characters forbidden in XML 1.0. This works byte-wise on purpose:
+     * all of these bytes are < 0x80 and therefore never appear inside a
+     * multi-byte UTF-8 sequence, whose continuation bytes are 0x80-0xBF. */
+    $sValor = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F]/', '', $sValor);
+
+    // Escape de '&': identico al que hacian las llamadas reemplazadas.
+    // '&' escaping: identical to what the replaced call sites did.
+    return str_replace('&', '&amp;', $sValor);
+}
+
 /**
  * Procedimiento que consulta toda la información de la base de datos sobre
  * una llamada de campaña. Se usa para el evento agentlinked, así como para
@@ -306,14 +368,23 @@ function construirEventoPauseEnd($db, $sAgente, $id_audit_break, $pause_class)
 
 function cargarInfoPausa($db, &$infoAgente, &$recordset)
 {
-    if (!is_null($infoAgente['id_audit_break'])) {
-        if (is_null($recordset)) {
-            $recordset = $db->prepare(
-                'SELECT audit.datetime_init, break.name '.
-                'FROM audit, break WHERE audit.id_break = break.id AND audit.id = ?');
-        }
+    /* El hold es un break de tipo 'H': ambos escriben una fila de audit con
+     * datetime_init, y el Agente los sigue en campos paralelos
+     * (id_audit_break / id_audit_hold). La consulta va por audit.id, así que
+     * sirve igual para los dos. */
+    /* EN: A hold is a break of type 'H': both write an audit row with
+     * datetime_init, and Agente tracks them in parallel fields
+     * (id_audit_break / id_audit_hold). The query is keyed on audit.id, so it
+     * serves both. */
+    $bHayBreak = !is_null($infoAgente['id_audit_break']);
+    $bHayHold  = isset($infoAgente['id_audit_hold']) && !is_null($infoAgente['id_audit_hold']);
+
+    if (($bHayBreak || $bHayHold) && is_null($recordset)) {
+        $recordset = $db->prepare(
+            'SELECT audit.datetime_init, break.name '.
+            'FROM audit, break WHERE audit.id_break = break.id AND audit.id = ?');
     }
-    if (!is_null($infoAgente['id_audit_break'])) {
+    if ($bHayBreak) {
         $recordset->execute(array($infoAgente['id_audit_break']));
         $tupla = $recordset->fetch(PDO::FETCH_ASSOC);
         $recordset->closeCursor();
@@ -322,22 +393,92 @@ function cargarInfoPausa($db, &$infoAgente, &$recordset)
             $infoAgente['pausestart'] = $tupla['datetime_init'];
         }
     }
+    if ($bHayHold) {
+        // Inicio del hold actual, para que la consola pueda mostrar (y
+        // recuperar tras un refresco) el cronómetro del hold en curso.
+        // EN: start of the current hold, so the console can show - and
+        // restore after a refresh - the running hold timer.
+        $recordset->execute(array($infoAgente['id_audit_hold']));
+        $tupla = $recordset->fetch(PDO::FETCH_ASSOC);
+        $recordset->closeCursor();
+        if ($tupla) {
+            $infoAgente['holdstart'] = $tupla['datetime_init'];
+        }
+    }
+}
+
+/* Normaliza el errorInfo de una PDOException. PDO deja errorInfo en NULL para las
+ * excepciones generadas por el propio PDO y no por el driver (por ejemplo,
+ * rollBack() sin transacción activa), por lo que el acceso directo al arreglo no
+ * es seguro.
+ *
+ * Normalizes the errorInfo of a PDOException. PDO leaves errorInfo as NULL for
+ * exceptions raised by PDO itself rather than by the driver (for example,
+ * rollBack() with no active transaction), so direct array access is not safe. */
+function infoErrorPDO(PDOException $e)
+{
+    if (is_array($e->errorInfo) && count($e->errorInfo) >= 3) return $e->errorInfo;
+    return array('HY000', 0, $e->getMessage());
 }
 
 function esDeadlockTransaccion(PDOException $e)
 {
+    $info = infoErrorPDO($e);
     // 40001 - 1213 - Deadlock found when trying to get lock; try restarting transaction
-    return ($e->errorInfo[0] == '40001' && $e->errorInfo[1] == 1213);
+    return ($info[0] == '40001' && $info[1] == 1213);
 }
 
 function esLockTimeout(PDOException $e)
 {
+    $info = infoErrorPDO($e);
     // HY000 - 1205 - Lock wait timeout exceeded; try restarting transaction
-    return ($e->errorInfo[0] == 'HY000' && $e->errorInfo[1] == 1205);
+    return ($info[0] == 'HY000' && $info[1] == 1205);
 }
 
 function esReiniciable(PDOException $e)
 {
     return (esDeadlockTransaccion($e) || esLockTimeout($e));
+}
+
+/* Indica si la excepción corresponde a una pérdida de conexión con el servidor de
+ * base de datos. La acción pendiente DEBE conservarse: se reintentará una vez
+ * restablecida la conexión, para no perder registros de llamadas ni de auditoría
+ * durante un reinicio del servidor de base de datos.
+ *
+ * Indicates whether the exception corresponds to a lost connection with the
+ * database server. The pending action MUST be retained: it will be retried once
+ * the connection is restored, so that call and audit records are not lost during a
+ * restart of the database server. */
+function esErrorConexion(PDOException $e)
+{
+    $info = infoErrorPDO($e);
+    /* 2002 - no se puede conectar por socket local | cannot connect through local socket
+     * 2003 - no se puede conectar al servidor      | cannot connect to server
+     * 2006 - el servidor cerró la conexión         | server has gone away
+     * 2013 - conexión perdida durante la consulta  | lost connection during query
+     * 1053 - el servidor se está apagando          | server shutdown in progress
+     * 1040 - demasiadas conexiones                 | too many connections */
+    return in_array((int)$info[1], array(2002, 2003, 2006, 2013, 1053, 1040), TRUE);
+}
+
+/* Indica si la excepción corresponde a un fallo lógico permanente, que jamás podrá
+ * completarse por más que se reintente. La acción pendiente debe descartarse para
+ * que la cola pueda avanzar; de lo contrario bloquea indefinidamente a todas las
+ * acciones encoladas detrás de ella.
+ *
+ * Indicates whether the exception corresponds to a permanent logical failure that
+ * can never complete no matter how many times it is retried. The pending action
+ * must be discarded so that the queue can move forward; otherwise it indefinitely
+ * blocks every action queued behind it. */
+function esErrorPermanente(PDOException $e)
+{
+    $info = infoErrorPDO($e);
+    /* 23000 - violación de integridad referencial | integrity constraint violation
+     *         (1452 clave foránea | foreign key, 1062 clave duplicada | duplicate key,
+     *          1048 columna no nula | not null column)
+     * 42S22 - columna inexistente                 | unknown column
+     * 42S02 - tabla inexistente                   | unknown table
+     * 42000 - error de sintaxis o de permisos     | syntax error or access violation */
+    return in_array((string)$info[0], array('23000', '42S22', '42S02', '42000'), TRUE);
 }
 ?>

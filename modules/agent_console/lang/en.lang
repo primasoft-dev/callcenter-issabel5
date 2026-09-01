@@ -35,6 +35,7 @@ $arrLangModule = array(
 'Call Information' => 'Call Information',
 'Call Script' => 'Call Script',
 'Call successfully scheduled' => 'Call successfully scheduled',
+'Call on hold' => 'Call on hold',
 'Cannot start agent login' => 'Cannot start agent login',
 'Confirm contact' => 'Confirm contact',
 'Connected to call' => 'Connected to call',

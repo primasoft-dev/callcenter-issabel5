@@ -1,5 +1,38 @@
 #!/bin/bash
 
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+usage() {
+    cat <<EOF
+Issabel Call Center uninstaller
+
+Usage: $(basename "$0") [options]
+
+Options:
+  -h, --help   Show this help and exit
+
+Run as root. Removes the Issabel Call Center dialer and its web modules, then
+asks whether to drop the call_center MySQL database. Answer 'n' to keep your
+agents, campaigns, calls, forms, breaks and reports so a later installation can
+reuse them; 'y' starts from an empty database.
+EOF
+}
+
+# Parse arguments before anything is stopped or deleted below.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        *)
+            echo -e "${RED}Error: unknown option '$1'${NC}" >&2
+            echo "Run 'bash $0 --help' for usage." >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+
 #stop service and disable it
 systemctl stop issabeldialer 2>/dev/null || true
 systemctl disable issabeldialer 2>/dev/null || true
@@ -12,6 +45,12 @@ rm -rf /var/www/html/modules/{cb_extensions,client,dont_call_list,eccp_users,ext
 rm -rf /var/www/html/modules/{graphic_calls,hold_time,ingoings_calls_success,login_logout,queues}
 rm -rf /var/www/html/modules/{rep_agent_information,rep_agents_monitoring,rep_incoming_calls_monitoring}
 rm -rf /var/www/html/modules/{rep_incoming_campaigns_panel,rep_outgoing_campaigns_panel,reports_break,rep_trunks_used_per_hour}
+
+#remove ECCP TLS certificate (inlined rather than calling eccp-cert.sh, which
+#lives inside the dialer directory removed just below)
+rm -f /etc/issabel/dialer/eccp.pem /etc/issabel/dialer/eccp.key
+rmdir /etc/issabel/dialer 2>/dev/null
+rmdir /etc/issabel 2>/dev/null
 
 #remove dialer
 rm -rf /opt/issabel/dialer
@@ -50,6 +89,17 @@ if [ -f "$EXTENSIONS_FILE" ]; then
         echo "Removed call center contexts from $EXTENSIONS_FILE"
         # Reload Asterisk dialplan
         asterisk -rx "dialplan reload" 2>/dev/null || true
+    fi
+fi
+
+#remove the call center parking lot from res_parking_custom_general.conf
+PARKING_FILE="/etc/asterisk/res_parking_custom_general.conf"
+if [ -f "$PARKING_FILE" ]; then
+    if grep -q "; BEGIN ISSABEL CALL-CENTER PARKING LOT DO NOT REMOVE THIS LINE" "$PARKING_FILE"; then
+        sed -i '/^; BEGIN ISSABEL CALL-CENTER PARKING LOT DO NOT REMOVE THIS LINE$/,/^; END ISSABEL CALL-CENTER PARKING LOT DO NOT REMOVE THIS LINE$/d' "$PARKING_FILE"
+        echo "Removed call center parking lot from $PARKING_FILE"
+        # Reload parking so the callcenter_hold lot goes away
+        asterisk -rx "module reload res_parking" 2>/dev/null || true
     fi
 fi
 

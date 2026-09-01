@@ -128,6 +128,19 @@ if (file_exists($path_script_db))
     actualizarLongitudCampo($pDB, 'call_center', 'current_call_entry', 'ChannelClient', 50);
     actualizarLongitudCampo($pDB, 'call_center', 'current_calls', 'ChannelClient', 50);
 
+    /* Fijar el charset por omision de la base de datos misma. El CREATE
+     * DATABASE de paloSantoInstaller::createNewDatabaseMySQL() no lleva
+     * charset, asi que la base hereda el del servidor (latin1 en una
+     * instalacion tipica) aunque todas sus tablas sean utf8mb4. Cualquier
+     * CREATE TABLE futuro sin charset explicito heredaria latin1. */
+    /* Set the default charset of the database itself. The CREATE DATABASE in
+     * paloSantoInstaller::createNewDatabaseMySQL() carries no charset, so the
+     * database inherits the server default (latin1 on a typical install) even
+     * though all of its tables are utf8mb4. Any future CREATE TABLE without an
+     * explicit charset would inherit latin1. */
+    $pDB->genQuery('ALTER DATABASE call_center CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci');
+    fputs(STDERR, "INFO: call_center database default charset set to utf8mb4 | Es: charset por omision de la base call_center fijado a utf8mb4\n");
+
     // Convertir todas las tablas a utf8mb4 para soporte completo de Unicode
     // EN: Convert all tables to utf8mb4 for full Unicode support
     convertirCharsetUtf8mb4($pDB, 'call_center');
@@ -148,6 +161,7 @@ if (preg_match('/Asterisk (\d+)/', $output, $m)) {
 fputs(STDERR, "INFO: Detected Asterisk $astMajor for installer decisions\n");
 
 instalarContextosEspeciales($astMajor);
+instalarLoteParqueoCallCenter();
 
 if ($astMajor >= 12) {
     // app_agent_pool: install [agent-defaults] template and convert agents to section format
@@ -313,31 +327,6 @@ exten => _X.,n(skiprecord),Dial(${AGENTCHANNEL},300,tw)
 exten => h,1,Macro(hangupcall,)
 ';
 
-        // Callback agent attended transfer context (SIP/IAX2/PJSIP types)
-        // Dials device directly to avoid 20-second busy tone delay when target declines
-        $sContextos .= '
-; Attended transfer context for callback agents (SIP/IAX2/PJSIP)
-; Dials device directly to avoid busy tone delay from from-internal failure handling
-[cbext-atxfer]
-exten => _X.,1,NoOp(Issabel CallCenter: Callback attended transfer routing for ${EXTEN})
- same => n,Set(CLEAN_EXTEN=${FILTER(0123456789,${EXTEN})})
- same => n,ExecIf($["${CLEAN_EXTEN}" = ""]?Set(CLEAN_EXTEN=${EXTEN}))
- same => n,Set(DIAL_DEVICE=${DB(DEVICE/${CLEAN_EXTEN}/dial)})
- same => n,GotoIf($["${DIAL_DEVICE}" != ""]?direct)
- same => n(fallback),NoOp(Issabel CallCenter: No device found for ${CLEAN_EXTEN} - routing via from-internal)
- same => n,Dial(Local/${CLEAN_EXTEN}@from-internal/n,120)
- same => n,Hangup()
- same => n(direct),NoOp(Issabel CallCenter: Direct device dial: ${DIAL_DEVICE})
- same => n,GotoIf($["${DIAL_DEVICE:0:5}" = "PJSIP"]?pjsip)
- same => n,Dial(${DIAL_DEVICE},120)
- same => n,Hangup()
- same => n(pjsip),Set(PJSIP_CONTACTS=${PJSIP_DIAL_CONTACTS(${CLEAN_EXTEN})})
- same => n,ExecIf($["${PJSIP_CONTACTS}" = ""]?Set(PJSIP_CONTACTS=${DIAL_DEVICE}))
- same => n,NoOp(Issabel CallCenter: PJSIP dial: ${PJSIP_CONTACTS})
- same => n,Dial(${PJSIP_CONTACTS},120)
- same => n,Hangup()
-';
-
         // app_agent_pool contexts (Asterisk 12+):
         // [agent-login]: login via context (no Asterisk password prompt)
         // [atxfer-complete]: re-enter AgentLogin after attended transfer
@@ -368,22 +357,69 @@ exten => _X.,1,NoOp(Issabel CallCenter: Connecting to Agent ${EXTEN})
 [atxfer-hold]
 exten => s,1,NoOp(Issabel CallCenter: Attended Transfer - Caller on hold)
  same => n,Answer()
- same => n,MusicOnHold(default)
+ same => n,MusicOnHold(,1800)
+ same => n,NoOp(Issabel CallCenter: Attended transfer hold expired - releasing caller)
+ same => n,Hangup()
+
+; Reconnect the current channel with the held caller channel given in ARG1.
+;   ARG1: held caller channel (${ATXFER_HELD_CHAN})
+;   ARG2: "yes" when that caller is parked because the agent pressed Hold during
+;         the consultation (Agent type only) - see the giveup branch below.
+;
+; An attended transfer starts with ONE AMI Redirect carrying an ExtraChannel, and
+; Asterisk performs an independent async goto on each channel: the agent and the
+; caller then run in separate PBX threads with nothing synchronising them. When
+; the consultation Dial() fails synchronously inside the channel driver (an
+; unregistered chan_sip peer allocates no channel and sends no packet) the agent
+; thread can reach this reconnect before the caller has even left the previous
+; bridge, and Bridge() then returns BRIDGERESULT=FAILURE - a completely silent
+; outcome that left the caller alone on the MusicOnHold of [atxfer-hold].
+;
+; The caller only has to run three dialplan priorities to become bridgeable, so
+; retrying over a bounded window closes the race. SUCCESS, NONEXISTENT (the
+; caller has genuinely gone) and LOOP are final and return at once; only FAILURE
+; is retried.
+[atxfer-rebridge]
+exten => s,1,NoOp(Issabel CallCenter: reconnecting ${CHANNEL} with held caller ${ARG1})
+ same => n,Set(ATXFER_REBRIDGE_TRIES=0)
+ same => n,GotoIf($["${ARG1}" = ""]?nochan)
+ same => n(try),Set(ATXFER_REBRIDGE_TRIES=$[${ATXFER_REBRIDGE_TRIES} + 1])
+ same => n,Bridge(${ARG1})
+ same => n,GotoIf($["${BRIDGERESULT}" != "FAILURE"]?done)
+ same => n,GotoIf($[${ATXFER_REBRIDGE_TRIES} >= 20]?giveup)
+ same => n,Wait(0.1)
+ same => n,Goto(try)
+; Never force-release a parked caller (the agent pressed Hold during the
+; consultation): [atxfer-unhold] retrieves them from parking with Bridge(), and
+; the callcenter_hold lot caps them with its own parkingtime, so a Bridge()
+; failure here is an expected outcome and not a stranding.
+ same => n(giveup),GotoIf($["${ARG2}" = "yes"]?done)
+ same => n,Log(WARNING,Issabel CallCenter: no se pudo reconectar ${CHANNEL} con el cliente retenido ${ARG1} tras ${ATXFER_REBRIDGE_TRIES} intentos - se libera al cliente | EN: could not reconnect ${CHANNEL} with held caller ${ARG1} after ${ATXFER_REBRIDGE_TRIES} attempts - releasing the caller)
+ same => n,SoftHangup(${ARG1})
+ same => n,Goto(done)
+ same => n(nochan),Log(WARNING,Issabel CallCenter: no hay canal de cliente retenido que reconectar | EN: no held caller channel to reconnect with)
+ same => n(done),NoOp(Issabel CallCenter: reconnect finished BRIDGERESULT=${BRIDGERESULT} attempts=${ATXFER_REBRIDGE_TRIES})
+ same => n,Return()
 
 [atxfer-consult]
 exten => _X.,1,NoOp(Issabel CallCenter: Attended Transfer - Consulting ${EXTEN})
  same => n,Set(__ATXFER_HELD_CHAN=${ATXFER_HELD_CHAN})
  same => n,Set(AGENT_NUM=${ATXFER_AGENT_NUM})
- same => n,Dial(Local/${EXTEN}@from-internal,120,gF(atxfer-bridge^s^1))
+ same => n,Dial(Local/${EXTEN}@from-internal/n,120,gF(atxfer-bridge^s^1)U(atxfer-consult-answered^${AGENT_NUM}))
  same => n,NoOp(Issabel CallCenter: Consultation ended DIALSTATUS=${DIALSTATUS} - reconnecting with caller)
- same => n,UserEvent(ConsultationEnd,Agent: Agent/${AGENT_NUM})
- same => n,Bridge(${ATXFER_HELD_CHAN})
+ same => n,UserEvent(ConsultationEnd,Agent: Agent/${AGENT_NUM},Status: ${DIALSTATUS})
+ same => n,Gosub(atxfer-rebridge,s,1(${ATXFER_HELD_CHAN},${ATXFER_ON_HOLD}))
  same => n,GotoIf($["${ATXFER_ON_HOLD}" = "yes"]?holdwait)
  same => n,Goto(atxfer-complete,${AGENT_NUM},1)
  same => n(holdwait),Set(ATXFER_ON_HOLD=)
  same => n,UserEvent(AtxferHoldWait,Agent: Agent/${AGENT_NUM})
- same => n,Wait(300)
+ same => n,Wait(900)                        ; must track the callcenter_hold parkingtime
  same => n,Goto(atxfer-complete,${AGENT_NUM},1)
+
+[atxfer-consult-answered]
+exten => s,1,NoOp(Issabel CallCenter: Attended transfer consult answered by colleague for Agent/${ARG1})
+ same => n,UserEvent(ConsultationAnswered,Agent: Agent/${ARG1},Channel: ${CHANNEL})
+ same => n,Return()
 
 [atxfer-unhold]
 exten => s,1,NoOp(Issabel CallCenter: Agent retrieving call from hold via Bridge)
@@ -392,27 +428,92 @@ exten => s,1,NoOp(Issabel CallCenter: Agent retrieving call from hold via Bridge
  same => n,Goto(atxfer-complete,${AGENT_NUM},1)
  same => n(holdwait),Set(ATXFER_ON_HOLD=)
  same => n,UserEvent(AtxferHoldWait,Agent: Agent/${AGENT_NUM})
- same => n,Wait(300)
+ same => n,Wait(900)                        ; must track the callcenter_hold parkingtime
  same => n,Goto(atxfer-unhold,s,1)
 
 [atxfer-cancel-consult]
 exten => s,1,NoOp(Issabel CallCenter: Cancelling consultation - reconnecting agent to caller)
  same => n,UserEvent(ConsultationEnd,Agent: Agent/${ATXFER_AGENT_NUM})
- same => n,Bridge(${ATXFER_HELD_CHAN})
+ same => n,Gosub(atxfer-rebridge,s,1(${ATXFER_HELD_CHAN},${ATXFER_ON_HOLD}))
  same => n,GotoIf($["${ATXFER_ON_HOLD}" = "yes"]?holdwait)
  same => n,Goto(atxfer-complete,${ATXFER_AGENT_NUM},1)
  same => n(holdwait),Set(ATXFER_ON_HOLD=)
  same => n,UserEvent(AtxferHoldWait,Agent: Agent/${ATXFER_AGENT_NUM})
- same => n,Wait(300)
+ same => n,Wait(900)                        ; must track the callcenter_hold parkingtime
  same => n,Goto(atxfer-cancel-consult,s,1)
 
 [atxfer-bridge]
 exten => s,1,NoOp(Issabel CallCenter: Transfer complete - bridging target with held caller)
  same => n,Bridge(${ATXFER_HELD_CHAN})
  same => n,Hangup()
+
+; Attended transfer contexts for callback type logins (SIP/IAX2/PJSIP)
+; Same Redirect-based flow as the Agent type above, but the agent has no
+; AgentLogin session to re-enter, so the consult leg just hangs up when the
+; reconnected conversation ends. ATXFER_AGENT_ID carries the full agent id
+; (e.g. SIP/1002) because the dialer keys its consultation state on that,
+; not on a bare agent number. The device is dialled directly to avoid the
+; 20-second busy tone from from-internal failure handling; busy and DND are
+; checked by the dialer before the consultation is ever placed.
+[cbxfer-consult]
+exten => _X.,1,NoOp(Issabel CallCenter: Callback attended transfer - consulting ${EXTEN})
+ same => n,Set(__ATXFER_HELD_CHAN=${ATXFER_HELD_CHAN})
+ same => n,Set(AGENT_ID=${ATXFER_AGENT_ID})
+ same => n,Set(CLEAN_EXTEN=${FILTER(0123456789,${EXTEN})})
+ same => n,ExecIf($["${CLEAN_EXTEN}" = ""]?Set(CLEAN_EXTEN=${EXTEN}))
+ same => n,Set(DIAL_DEVICE=${DB(DEVICE/${CLEAN_EXTEN}/dial)})
+ same => n,ExecIf($["${DIAL_DEVICE:0:5}" = "PJSIP"]?Set(DIAL_DEVICE=${PJSIP_DIAL_CONTACTS(${CLEAN_EXTEN})}))
+ same => n,ExecIf($["${DIAL_DEVICE}" = ""]?Set(DIAL_DEVICE=Local/${CLEAN_EXTEN}@from-internal/n))
+ same => n,NoOp(Issabel CallCenter: Callback consult dial: ${DIAL_DEVICE})
+ same => n,Dial(${DIAL_DEVICE},120,gF(atxfer-bridge^s^1)U(cbxfer-consult-answered^${AGENT_ID}))
+ same => n,NoOp(Issabel CallCenter: Callback consultation ended DIALSTATUS=${DIALSTATUS} - reconnecting with caller)
+ same => n,UserEvent(ConsultationEnd,Agent: ${AGENT_ID},Status: ${DIALSTATUS})
+ same => n,Gosub(atxfer-rebridge,s,1(${ATXFER_HELD_CHAN}))
+ same => n,Hangup()
+
+[cbxfer-consult-answered]
+exten => s,1,NoOp(Issabel CallCenter: Callback consult answered by colleague for ${ARG1})
+ same => n,UserEvent(ConsultationAnswered,Agent: ${ARG1},Channel: ${CHANNEL})
+ same => n,Return()
+
+[cbxfer-cancel-consult]
+exten => s,1,NoOp(Issabel CallCenter: Cancelling callback consultation - reconnecting agent to caller)
+ same => n,UserEvent(ConsultationEnd,Agent: ${ATXFER_AGENT_ID})
+ same => n,Gosub(atxfer-rebridge,s,1(${ATXFER_HELD_CHAN}))
+ same => n,Hangup()
+
+[cbxfer-done]
+exten => s,1,NoOp(Issabel CallCenter: Callback consultation terminated - releasing agent channel)
+ same => n,Hangup()
 ';
         } else {
             fputs(STDERR, "INFO: Skipping app_agent_pool contexts (chan_agent on Asterisk $astMajor)\n");
+
+            // Legacy callback attended transfer target context, used only by the
+            // native Atxfer fallback on Asterisk 11/13. Asterisk 12+ uses the
+            // Redirect-based [cbxfer-*] contexts above instead.
+            $sContextos .= '
+; Attended transfer context for callback agents (SIP/IAX2/PJSIP) - Asterisk 11/13
+; Dials device directly to avoid busy tone delay from from-internal failure handling
+[cbext-atxfer]
+exten => _X.,1,NoOp(Issabel CallCenter: Callback attended transfer routing for ${EXTEN})
+ same => n,Set(CLEAN_EXTEN=${FILTER(0123456789,${EXTEN})})
+ same => n,ExecIf($["${CLEAN_EXTEN}" = ""]?Set(CLEAN_EXTEN=${EXTEN}))
+ same => n,Set(DIAL_DEVICE=${DB(DEVICE/${CLEAN_EXTEN}/dial)})
+ same => n,GotoIf($["${DIAL_DEVICE}" != ""]?direct)
+ same => n(fallback),NoOp(Issabel CallCenter: No device found for ${CLEAN_EXTEN} - routing via from-internal)
+ same => n,Dial(Local/${CLEAN_EXTEN}@from-internal/n,120)
+ same => n,Hangup()
+ same => n(direct),NoOp(Issabel CallCenter: Direct device dial: ${DIAL_DEVICE})
+ same => n,GotoIf($["${DIAL_DEVICE:0:5}" = "PJSIP"]?pjsip)
+ same => n,Dial(${DIAL_DEVICE},120)
+ same => n,Hangup()
+ same => n(pjsip),Set(PJSIP_CONTACTS=${PJSIP_DIAL_CONTACTS(${CLEAN_EXTEN})})
+ same => n,ExecIf($["${PJSIP_CONTACTS}" = ""]?Set(PJSIP_CONTACTS=${DIAL_DEVICE}))
+ same => n,NoOp(Issabel CallCenter: PJSIP dial: ${PJSIP_CONTACTS})
+ same => n,Dial(${PJSIP_CONTACTS},120)
+ same => n,Hangup()
+';
         }
 
         $contenido[] = $sContextos;
@@ -420,6 +521,97 @@ exten => s,1,NoOp(Issabel CallCenter: Transfer complete - bridging target with h
         file_put_contents($sArchivo, $contenido);
         chown($sArchivo, 'asterisk'); chgrp($sArchivo, 'asterisk');
     }
+}
+
+/**
+ * Procedimiento que instala el lote de parqueo dedicado del Call Center.
+ *
+ * EN: Function that installs the Call Center's dedicated parking lot.
+ *
+ * La funcion Hold del agente parquea el canal del cliente. El lote "default" del
+ * PBX lo genera IssabelPBX con courtesytone=beep y parkedplay=both, de modo que
+ * tanto el agente como el cliente escuchaban un beep en cada End Hold, mientras
+ * que un hold tomado tras una transferencia atendida fallida se recupera con
+ * Bridge() y era silencioso. Un lote propio sin courtesytone deja el ciclo de
+ * hold silencioso en ambos caminos y no toca el lote del PBX.
+ *
+ * EN: The agent Hold feature parks the customer's channel. The PBX "default" lot
+ * is generated by IssabelPBX with courtesytone=beep and parkedplay=both, so both
+ * the agent and the customer heard a beep on every End Hold, while a hold taken
+ * after a failed attended transfer is resumed with Bridge() and stayed silent. A
+ * dedicated lot with no courtesytone makes the hold cycle silent either way and
+ * leaves the PBX lot untouched.
+ */
+function instalarLoteParqueoCallCenter()
+{
+    $sArchivo = '/etc/asterisk/res_parking_custom_general.conf';
+    $sInicioContenido = "; BEGIN ISSABEL CALL-CENTER PARKING LOT DO NOT REMOVE THIS LINE\n";
+    $sFinalContenido =  "; END ISSABEL CALL-CENTER PARKING LOT DO NOT REMOVE THIS LINE\n";
+
+    // Cargar el archivo, notando el inicio y el final del area del lote de parqueo
+    // EN: Load the file, noting the start and end of the parking lot area
+    $bEncontradoInicio = $bEncontradoFinal = FALSE;
+    $contenido = array();
+    $arrLineas = file_exists($sArchivo) ? file($sArchivo) : array();
+    foreach ($arrLineas as $sLinea) {
+        if ($sLinea == $sInicioContenido) {
+            $bEncontradoInicio = TRUE;
+        } elseif ($sLinea == $sFinalContenido) {
+            $bEncontradoFinal = TRUE;
+        } elseif (!$bEncontradoInicio || $bEncontradoFinal) {
+            if (substr($sLinea, strlen($sLinea) - 1) != "\n")
+                $sLinea .= "\n";
+            $contenido[] = $sLinea;
+        }
+    }
+    if ($bEncontradoInicio xor $bEncontradoFinal) {
+        fputs(STDERR, "ERR: no se puede localizar correctamente segmento de lote de parqueo de Call Center | EN: ERR: cannot correctly locate Call Center parking lot segment\n");
+        return;
+    }
+
+    $sLote = <<<'PARKINGLOT'
+;
+; Dedicated parking lot for the Call Center agent Hold feature.
+;
+; The agent Hold button parks the customer's channel; End Hold retrieves it.
+; The PBX "default" lot sets courtesytone=beep with parkedplay=both, so both the
+; agent and the customer heard a beep on every End Hold - while a hold taken
+; after a failed/cancelled attended transfer is resumed with Bridge() instead of
+; ParkedCall() and was therefore silent. This lot has no courtesytone, so the
+; hold cycle is silent either way, and the PBX "default" lot keeps its beep for
+; ordinary *7000 parking.
+;
+; It shares the "parkedcalls" context with the default lot: Asterisk only
+; forbids overlapping generated *extensions*, and 70000/70001-70100 does not
+; overlap 7000/7001-7010. Sharing the context means 70001-70100 are already
+; reachable from from-internal, so the dialer needs no new dialplan.
+;
+[callcenter_hold]
+parkext = 70000
+parkext_exclusive = yes
+parkpos = 70001-70100
+context = parkedcalls
+parkingtime = 900
+comebacktoorigin = no
+findslot = first
+parkedcalltransfers = caller
+parkedcallreparking = caller
+parkedmusicclass = default
+; courtesytone deliberately unset -> Asterisk default is "no tone", so neither
+;   the agent nor the customer hears a beep when a held call is retrieved.
+; parkedmusicclass mirrors the PBX lot. It is only a fallback: a class set on
+;   the channel itself wins, so a queue caller keeps the queue's MOH (verified -
+;   the parked leg reports "class 'Primasoft'", not "default"). Naming it here
+;   rather than leaving it blank guarantees MOH for a channel that carries no
+;   class of its own, e.g. an outbound campaign call.
+PARKINGLOT;
+
+    $contenido[] = $sInicioContenido;
+    $contenido[] = $sLote."\n";
+    $contenido[] = $sFinalContenido;
+    file_put_contents($sArchivo, $contenido);
+    chown($sArchivo, 'asterisk'); chgrp($sArchivo, 'asterisk');
+    fputs(STDERR, "INFO: lote de parqueo callcenter_hold instalado en $sArchivo | EN: INFO: callcenter_hold parking lot installed in $sArchivo\n");
 }
 
 /**

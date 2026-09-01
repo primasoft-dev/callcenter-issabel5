@@ -155,8 +155,8 @@ class AMIClientConn extends MultiplexConn
             array('Queue' => TRUE, 'Interface' => TRUE,
                 'Penalty' => array('required' => FALSE, 'default' => 0, 'cast' => 'int'),
                 'MemberName' => FALSE,
-                'StateInterface' => FALSE,  // For app_agent_pool: Agent:XXXX device state
-                'Paused' => array('required' => FALSE, 'default' => FALSE, 'cast' => 'bool')),
+                'Paused' => array('required' => FALSE, 'default' => FALSE, 'cast' => 'bool'),
+                'StateInterface' => FALSE),  // For app_agent_pool: Agent:XXXX device state
         'QueueRemove' =>
             array('Queue' => TRUE, 'Interface' => TRUE),
         'Queues' =>
