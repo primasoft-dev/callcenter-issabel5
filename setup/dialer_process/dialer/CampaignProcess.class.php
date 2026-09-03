@@ -1328,7 +1328,21 @@ SQL_LLAMADA_COLOCADA;
                 'CONTEXT'       =>  $infoCampania['context'],
             );
             if (!is_null($tupla['agent'])) {
-                $listaVars['AGENTCHANNEL'] = $tupla['agent'];
+                /* calls.agent guarda el canal lógico del agente: Agent/XXXX para
+                 * agentes de tipo Agent, SIP/XXX o PJSIP/XXX para los de tipo
+                 * callback. El contexto llamada_agendada marca este valor tal
+                 * cual, y chan_agent ya no existe desde Asterisk 12, así que
+                 * Agent/XXXX debe traducirse a la interfaz de app_agent_pool.
+                 * calls.agent stores the agent's logical channel: Agent/XXXX for
+                 * Agent type agents, SIP/XXX or PJSIP/XXX for callback type. The
+                 * llamada_agendada context dials this value as-is, and chan_agent
+                 * no longer exists since Asterisk 12, so Agent/XXXX must be
+                 * translated to the app_agent_pool interface. */
+                $sCanalMarcarAgente = $tupla['agent'];
+                if (!is_null($this->_compat) &&
+                    preg_match('|^Agent/(\d+)$|', $sCanalMarcarAgente, $regsAgente))
+                    $sCanalMarcarAgente = $this->_compat->getAgentQueueInterface($regsAgente[1]);
+                $listaVars['AGENTCHANNEL'] = $sCanalMarcarAgente;
                 if (is_null($queue_monitor_format))
                     $queue_monitor_format = $this->_formatoGrabacionCola($infoCampania['queue']);
                 $listaVars['QUEUE_MONITOR_FORMAT'] = $queue_monitor_format;
@@ -1337,7 +1351,8 @@ SQL_LLAMADA_COLOCADA;
             if ($this->DEBUG) {
                 $this->_log->output("DEBUG: ".__METHOD__." generating call | generando llamada\n".
                     "\tKey/Clave....... {$tupla['actionid']}\n" .
-                    "\tAgent/Agente...... ".(is_null($tupla['agent']) ? '(none/ninguno)' : $tupla['agent'])."\n" .
+                    "\tAgent/Agente...... ".(is_null($tupla['agent']) ? '(none/ninguno)' : $tupla['agent'].
+                        ($tupla['agent'] == $listaVars['AGENTCHANNEL'] ? '' : ' -> '.$listaVars['AGENTCHANNEL']))."\n" .
                     "\tDestination/Destino..... {$tupla['phone']}\n" .
                     "\tQueue/Cola........ {$infoCampania['queue']}\n" .
                     "\tContext/Contexto.... {$infoCampania['context']}\n" .
